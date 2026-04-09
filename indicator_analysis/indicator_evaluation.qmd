@@ -1,0 +1,1915 @@
+---
+title: "Candidate Eval: `r params$candidate_name` via `r params$guiding_name`"
+author: "Delphi Group"
+date: today
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+params:
+  # Guiding Indicator
+  guiding_source: "hhs"
+  guiding_signal: "confirmed_admissions_covid_1d"
+  guiding_name:   "COVID Hospital Admissions (HHS)"
+  guiding_csv: !expr "NULL"
+  # Candidate Indicator
+  candidate_source: "doctor-visits"
+  candidate_signal: "smoothed_adj_cli"
+  candidate_name:   "Doctor Visits: Smoothed Adj CLI"
+  candidate_csv: !expr "NULL"
+  # Shared settings
+  geo_type:  "state"
+  time_type: "day"
+  start_day: "2020-09-01"
+  end_day:   "2023-03-01"
+  # Maximum locations to show in plots/tables
+  max_locations_plot: 6
+  max_locations_table: 15
+knitr:
+  opts_chunk:
+    comment: "#>"
+    message: FALSE
+    warning: FALSE
+    out.width: "100%"
+    dev: "png"
+    fig.width: 8
+    fig.height: 4.5
+    fig.align: center
+editor_options: 
+  chunk_output_type: console
+execute:
+  cache: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+# When running interactively, populate params from defaults
+if (!exists("params")) {
+    params <- list(
+        guiding_source = "nhsn",
+        guiding_signal = "confirmed_admissions_covid_ew",
+        guiding_name = "COVID Hospital Admissions (NHSN)",
+        # Candidate Indicator,
+        candidate_source = "beta_pophive",
+        candidate_signal = "epic_pct_covid_total",
+        candidate_name = "PopHive: Epic % COVID Total",
+        # Shared settings,
+        geo_type = "state",
+        time_type = "week",
+        start_day = "2022-01-01",
+        end_day = "2025-12-31",
+        max_locations_plot = 6,
+        max_locations_table = 15
+    )
+}
+
+# Load libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+    epidatr, epiprocess, covidcast,
+    tidyverse, scales, patchwork,
+    knitr, here, MMWRweek, glue, DT
+)
+
+# Invalidate knitr cache when params change
+knitr::opts_chunk$set(cache.extra = list(params))
+
+# Set theme and colors
+colours <- c(
+    "#172431",
+    "#ffffff",
+    "#C41230",
+    "#941120",
+    "#007BC0",
+    "#002676",
+    "#FDB515",
+    "#002145",
+    "#00A7E1",
+    "#8C338F",
+    "#368f33"
+)
+
+# Palette selection
+dis_pal_list <- colours[c(3, 5, 7, 10, 11, 9)]
+
+theme_set(
+    theme_minimal(base_family = "Lato", base_size = 12) +
+        theme(
+            plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+            plot.caption = element_text(hjust = 0, color = "gray50"),
+            panel.grid = element_line(linetype = 2, size = 0.3, color = "gray90"),
+            panel.grid.minor = element_blank(),
+            legend.position = "top",
+            strip.background = element_rect(fill = "gray95", linetype = "blank"),
+            panel.border = element_rect(color = "gray95", fill = NA)
+        )
+)
+
+# Palette as global defaults for discrete and continuous scales
+options(
+    ggplot2.discrete.colour   = dis_pal_list,
+    ggplot2.discrete.fill     = dis_pal_list,
+    ggplot2.continuous.colour = function() scale_colour_gradientn(colours = dis_pal_list),
+    ggplot2.continuous.fill   = function() scale_fill_gradientn(colours = dis_pal_list)
+)
+
+# Update defaults for geoms/stats
+tibble::tribble(
+    ~name,      ~aes,     ~alpha, ~is_stat,
+    "line",     "colour", 1.0,    FALSE,
+    "point",    "colour", 0.7,    FALSE,
+    "function", "colour", 1.0,    FALSE,
+    "bar",      "fill",   0.9,    FALSE,
+    "col",      "fill",   0.9,    FALSE,
+    "boxplot",  "fill",   0.8,    FALSE,
+    "bin",      "fill",   0.8,    TRUE,
+    "identity", "fill",   0.7,    TRUE
+) %>%
+    purrr::pwalk(function(name, aes, alpha, is_stat) {
+        updater <- if (is_stat) update_stat_defaults else update_geom_defaults
+        updater(name, setNames(list(dis_pal_list[1], alpha), c(aes, "alpha")))
+    })
+
+# Helper: build epirange with correct format for the signal's time_type
+time_range <- function(start, end, time_type = params$time_type) {
+    if (time_type == "week") {
+        to_yw <- function(d) {
+            d <- as.Date(d)
+            m <- MMWRweek::MMWRweek(d)
+            m$MMWRyear * 100L + m$MMWRweek
+        }
+        epirange(to_yw(start), to_yw(end))
+    } else {
+        epirange(start, end)
+    }
+}
+
+# Helper: map geo codes to human-readable names
+geo_to_name <- function(geos, geo_type = params$geo_type) {
+    if (geo_type == "state") {
+        states <- covidcast::state_census
+        names <- states$NAME[match(toupper(geos), states$ABBR)]
+        names[is.na(names)] <- geos[is.na(names)]
+        return(names)
+    } else if (geo_type == "county") {
+        names <- covidcast::fips_to_name(geos)
+        names[is.na(names)] <- geos[is.na(names)]
+        return(names)
+    } else {
+        return(geos)
+    }
+}
+
+# Helper: equally interspersed samples from a vector
+interspersed_sample <- function(vec, n = 15) {
+    if (length(vec) <= n) {
+        return(vec)
+    }
+    idx <- round(seq(1, length(vec), length.out = n))
+    vec[idx]
+}
+
+# Set cache
+cache_path <- here::here("signal_analysis", "epidatr_cache")
+if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
+
+set_cache(cache_dir = cache_path)
+```
+
+This notebook evaluates a **candidate indicator** against a **guiding indicator**
+(presumed ground truth) to determine whether the candidate has value for
+nowcasting or forecasting.
+
+```{r}
+#| label: print-config
+#| echo: false
+config_tbl <- tibble(
+    Role = c("Guiding", "Candidate"),
+    Source = c(params$guiding_source, params$candidate_source),
+    Signal = c(params$guiding_signal, params$candidate_signal),
+    Label = c(params$guiding_name, params$candidate_name)
+)
+
+DT::datatable(config_tbl, caption = sprintf(
+    "Geo-level: %s · Period: %s to %s",
+    params$geo_type, params$start_day, params$end_day
+), rownames = FALSE, options = list(scrollX = TRUE, dom = "t"))
+```
+
+---
+
+## Data Loading {#data}
+
+```{r}
+#| label: load-guiding
+#| results: asis
+
+# Load guiding indicator
+if (!is.null(params$guiding_csv)) {
+    cat("- Loaded guiding indicator from CSV  \n")
+    df_guiding <- read.csv(params$guiding_csv) %>%
+        mutate(time_value = as.Date(time_value)) %>%
+        filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day)) %>%
+        as_epi_df()
+} else {
+    cat("- Fetched guiding indicator from API  \n")
+    df_guiding <- pub_covidcast(
+        params$guiding_source, params$guiding_signal,
+        params$geo_type, params$time_type,
+        time_values = time_range(params$start_day, params$end_day),
+        as_of = Sys.Date()
+    ) %>% as_epi_df()
+}
+
+cat(sprintf(
+    "- **Summary**: %s rows across %s locations\n",
+    label_comma()(nrow(df_guiding)), label_comma()(n_distinct(df_guiding$geo_value))
+))
+```
+
+```{r}
+#| label: load-candidate
+#| results: asis
+
+# Load candidate indicator
+candidate_archive <- NULL
+if (!is.null(params$candidate_csv)) {
+    cat("- Loaded candidate indicator from CSV  \n")
+    df_candidate_raw <- read.csv(params$candidate_csv) %>%
+        mutate(time_value = as.Date(time_value)) %>%
+        filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day))
+
+    # CSV may include version/issue columns for revision analysis
+    has_versions <- any(c("version", "issue") %in% colnames(df_candidate_raw))
+    if (has_versions) {
+        df_candidate_raw <- df_candidate_raw %>%
+            {
+                if ("issue" %in% names(.)) rename(., version = issue) else .
+            } %>%
+            mutate(version = as.Date(version))
+        candidate_archive <- df_candidate_raw %>%
+            select(geo_value, time_value, version, value) %>%
+            as_epi_archive()
+        df_candidate <- epix_as_of(candidate_archive, candidate_archive$versions_end)
+        cat(sprintf(
+            "- CSV contains version history: %s versions (will be used for revision analysis)  \n",
+            label_comma()(n_distinct(df_candidate_raw$version))
+        ))
+    } else {
+        df_candidate <- df_candidate_raw %>% as_epi_df()
+    }
+} else {
+    cat("- Fetched candidate indicator from API  \n")
+    df_candidate <- pub_covidcast(
+        params$candidate_source, params$candidate_signal,
+        params$geo_type, params$time_type,
+        time_values = time_range(params$start_day, params$end_day),
+        as_of = Sys.Date()
+    ) %>% as_epi_df()
+}
+
+cat(sprintf(
+    "- **Summary**: %s rows across %s locations\n",
+    label_comma()(nrow(df_candidate)), label_comma()(n_distinct(df_candidate$geo_value))
+))
+```
+
+```{r}
+#| label: load-candidate-archive
+#| results: asis
+
+# Fetch revision history from API if not already built from CSV
+if (is.null(candidate_archive) && is.null(params$candidate_csv)) {
+    set.seed(42)
+    max_archive_locs <- 60
+    all_geos <- unique(df_candidate$geo_value)
+    archive_geos <- sort(sample(all_geos, min(max_archive_locs, length(all_geos))))
+    archive_start <- as.character(max(
+        as.Date(params$start_day),
+        as.Date(params$end_day) - lubridate::years(1)
+    ))
+
+    archive_info <- list(
+        n_sampled = length(archive_geos),
+        n_total = length(all_geos),
+        time_value_start = archive_start,
+        time_value_end = params$end_day
+    )
+
+    # Request only for the sampled locations and the relevant time range
+    # to avoid server-side timeouts/errors on large signals.
+    df_archive_raw <- pub_covidcast(
+        source = params$candidate_source,
+        signal = params$candidate_signal,
+        geo_type = params$geo_type,
+        time_type = params$time_type,
+        geo_values = archive_geos,
+        time_values = time_range(archive_start, params$end_day),
+        issues = "*",
+    )
+
+    if (nrow(df_archive_raw) > 0 && "issue" %in% colnames(df_archive_raw)) {
+        archive_info$version_start <- min(df_archive_raw$issue)
+        archive_info$version_end <- max(df_archive_raw$issue)
+        candidate_archive <- df_archive_raw %>%
+            rename(version = issue) %>%
+            select(geo_value, time_value, version, value) %>%
+            as_epi_archive()
+    }
+}
+```
+
+```{r}
+#| label: combine-data
+#| results: asis
+
+# Infer time type from guiding
+env_time_type <- attributes(df_guiding)$metadata$time_type
+if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
+    env_time_type <- params$time_type
+}
+
+# When time_type is weekly, align all dates to Sundays and aggregate
+if (env_time_type == "week") {
+    round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
+
+    df_guiding <- df_guiding %>%
+        mutate(time_value = round_to_sunday(time_value)) %>%
+        group_by(geo_value, time_value) %>%
+        summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+        as_epi_df()
+
+    df_candidate <- df_candidate %>%
+        mutate(time_value = round_to_sunday(time_value)) %>%
+        group_by(geo_value, time_value) %>%
+        summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+        as_epi_df()
+
+    cat("- Aligned both datasets to Sunday-start weeks  \n")
+}
+
+# Combine into a single epi_df
+grid_start <- as.Date(params$start_day)
+grid_end <- as.Date(params$end_day)
+if (env_time_type == "week") {
+    grid_start <- round_to_sunday(grid_start)
+    grid_end <- round_to_sunday(grid_end)
+}
+
+df <- df_guiding %>%
+    rename(guiding = value) %>%
+    full_join(
+        df_candidate %>% select(geo_value, time_value, value) %>%
+            rename(candidate = value),
+        by = c("geo_value", "time_value")
+    ) %>%
+    group_by(geo_value) %>%
+    complete(
+        time_value = seq.Date(
+            from = grid_start,
+            to = grid_end,
+            by = env_time_type
+        )
+    ) %>%
+    ungroup() %>%
+    as_epi_df()
+
+n_locations <- n_distinct(df$geo_value)
+cat(sprintf(
+    "- **Combined (full join)**: %s rows, %s locations (%s to %s)  \n",
+    label_comma()(nrow(df)), label_comma()(n_locations),
+    min(df$time_value), max(df$time_value)
+))
+
+# Intersected where both signals must be present
+df_inter <- df %>%
+    filter(!is.na(candidate), !is.na(guiding))
+
+cat(sprintf(
+    "- **Intersection (both present)**: %s rows (%.1f%% of full grid)\n\n",
+    label_comma()(nrow(df_inter)), 100 * nrow(df_inter) / nrow(df)
+))
+
+start_day <- min(df$time_value)
+end_day <- max(df$time_value)
+n_inter_locations <- n_distinct(df_inter$geo_value)
+
+# Define adaptive units and lag ranges for downstream analysis
+time_unit <- switch(env_time_type %||% "unknown",
+    week = "weeks",
+    month = "months",
+    year = "years",
+    "days" # default
+)
+lag_unit_label <- sprintf("Lag (%s)", time_unit)
+
+# Standard discrete lags to check
+lag_values <- switch(env_time_type %||% "unknown",
+    week = -2:2,
+    month = -2:2,
+    year = -1:1,
+    c(-14, -7, 0, 7, 14) # default
+)
+
+# Systematic sweep range (includes negative lags/leads)
+lags_sweep <- switch(env_time_type %||% "unknown",
+    week = -5:5,
+    month = -5:5,
+    year = -2:2,
+    -21:21 # default
+)
+
+```
+
+---
+
+## Exploratory Data Analysis {#eda}
+
+The data is aggregated at the `r params$geo_type` level. The intersection of candidate and guiding datasets contains `r n_inter_locations` valid locations measured at a `r env_time_type`-level frequency.
+
+### Time Series Overview
+
+This section provides a direct visual comparison of the guiding and candidate indicators over time for a subset of observation locations. We start by looking at the raw values for both indicators across a sample of locations. Then, a third plot overlays both indicators after normalizing them. 
+
+```{r}
+#| label: eda-overview
+#| fig-height: 8
+# Pick a diverse sample of locations for visualization
+all_geos <- sort(unique(df_inter$geo_value))
+n_plot <- min(length(all_geos), params$max_locations_plot)
+sample_geos <- if (n_plot > 0) {
+    all_geos[round(seq(1, length(all_geos), length.out = n_plot))]
+} else {
+    character(0)
+}
+
+df_long <- df_inter %>%
+    filter(geo_value %in% sample_geos) %>%
+    pivot_longer(
+        cols = c(candidate, guiding),
+        names_to = "indicator", values_to = "value"
+    ) %>%
+    group_by(geo_value, indicator) %>%
+    mutate(value_norm = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(indicator = recode(indicator,
+        candidate = params$candidate_name,
+        guiding = params$guiding_name
+    ))
+
+# Determine point size based on timeline duration for visibility
+n_days_eval <- as.numeric(difftime(as.Date(params$end_day), as.Date(params$start_day), units = "days"))
+eda_point_size <- if (n_days_eval > 730) 0.3 else if (n_days_eval > 365) 0.5 else 0.8
+
+ggplot(df_long %>% filter(indicator == params$guiding_name), aes(x = time_value, y = value, color = indicator)) +
+    geom_line(linewidth = 0.7, alpha = 0.3) +
+    geom_point(size = eda_point_size, alpha = 0.5) +
+    facet_wrap(~geo_value, ncol = 3, scales = "free_y") +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_color_manual(values = dis_pal_list[1]) +
+    labs(
+        title = "Guiding Indicator",
+        subtitle = params$guiding_name,
+        x = "Date", y = "Value", color = "Indicator"
+    ) +
+    theme(legend.position = "none")
+
+ggplot(df_long %>% filter(indicator == params$candidate_name), aes(x = time_value, y = value, color = indicator)) +
+    geom_line(linewidth = 0.7, alpha = 0.3) +
+    geom_point(size = eda_point_size, alpha = 0.5) +
+    facet_wrap(~geo_value, ncol = 3, scales = "free_y") +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_color_manual(values = dis_pal_list[2]) +
+    labs(
+        title = "Candidate Indicator",
+        subtitle = params$candidate_name,
+        x = "Date", y = "Value", color = "Indicator"
+    ) +
+    theme(legend.position = "none")
+
+```
+
+In this normalized view, overlapping patterns, lead-lag relationships, or divergent behavior become easier to spot. For instance, if the candidate curve tends to rise before the guiding curve, we might have a useful leading relationship.
+
+```{r}
+#| label: eda-overview-normalized
+#| fig-height: 8
+
+
+ggplot(df_long, aes(x = time_value, y = value_norm, color = indicator)) +
+    geom_line(linewidth = 0.7, alpha = 0.3) +
+    geom_point(size = eda_point_size, alpha = 0.4) +
+    facet_wrap(~geo_value, ncol = 3) +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    labs(
+        title = "Trend Comparison",
+        subtitle = "Normalized indicators per location",
+        x = "Date", y = "StandardizedValue", color = "Indicator"
+    )
+```
+
+```{r}
+#| label: eda-quantiles-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Quantile Trends\n\n")
+cat("This plot displays the distribution of both indicators over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use different scales for the top and bottom panels so each indicator's distribution is clearly visible.\n\n")
+cat("By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.\n\n")
+```
+
+```{r}
+#| label: eda-quantiles
+#| fig-height: 8
+#| eval: !expr n_inter_locations > 1
+
+cat("\n")
+
+df_quantiles_wide <- df_inter %>%
+    pivot_longer(
+        cols = c(candidate, guiding),
+        names_to = "indicator", values_to = "value"
+    ) %>%
+    group_by(time_value, indicator) %>%
+    summarize(vals = list(value), .groups = "drop") %>%
+    mutate(geo_value = indicator) %>%
+    as_epi_df()
+
+# Handle time frequency differences for .window_size.
+window_size <- switch(env_time_type %||% "unknown",
+    day   = 7L, # 7-day smoothing
+    week  = as.difftime(3, units = "weeks"), # 3-week smoothing
+    month = as.difftime(3, units = "months"), # 3-month smoothing
+    year  = as.difftime(3, units = "years"), # 3-year smoothing
+    Inf # Default to cumulative for unknown types
+    # (too sparse for sliding averages)
+)
+
+df_quantiles_wide <- df_quantiles_wide %>%
+    group_by(geo_value) %>%
+    epi_slide(
+        ~ tibble(
+            `0.05` = quantile(unlist(.x$vals), 0.05, na.rm = TRUE),
+            `0.25` = quantile(unlist(.x$vals), 0.25, na.rm = TRUE),
+            `0.5`  = quantile(unlist(.x$vals), 0.5, na.rm = TRUE),
+            `0.75` = quantile(unlist(.x$vals), 0.75, na.rm = TRUE),
+            `0.95` = quantile(unlist(.x$vals), 0.95, na.rm = TRUE)
+        ),
+        .window_size = window_size
+    ) %>%
+    ungroup() %>%
+    mutate(
+        indicator = recode(geo_value,
+            candidate = params$candidate_name,
+            guiding = params$guiding_name
+        )
+    )
+
+ggplot(df_quantiles_wide, aes(x = time_value)) +
+    geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
+    geom_ribbon(aes(ymin = `0.25`, ymax = `0.75`, fill = "25%-75%"), alpha = 0.4) +
+    geom_line(aes(y = `0.5`, color = "Median"), size = 1) +
+    facet_wrap(~indicator, ncol = 1, scales = "free_y") +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_y_continuous(labels = scales::label_comma()) +
+    scale_fill_manual(values = c("5%-95%" = dis_pal_list[2], "25%-75%" = dis_pal_list[2])) +
+    scale_color_manual(values = c("Median" = dis_pal_list[2])) +
+    labs(
+        title = "Smoothed Quantile Trends",
+        subtitle = sprintf("Across all %d locations, smoothed window: %s", n_inter_locations, format(window_size)),
+        x = "Date", y = "Value (smoothed)",
+        fill = "Range", color = "Trend"
+    ) +
+    theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: eda-aberrant-locations-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("#### Aberrant Locations\n\n")
+cat("While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the daily 95th percentile) for each indicator.\n\n")
+```
+
+```{r}
+#| label: eda-aberrant-locations
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+
+# Calculate daily 95th percentiles directly from the data
+daily_p95 <- df_inter %>%
+    group_by(time_value) %>%
+    summarize(
+        cand_p95 = quantile(candidate, 0.95, na.rm = TRUE),
+        guid_p95 = quantile(guiding, 0.95, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+# Find how often each location exceeds the 95th percentile
+aberrant_locs <- df_inter %>%
+    left_join(daily_p95, by = "time_value") %>%
+    group_by(geo_value) %>%
+    summarize(
+        n_days = n(),
+        cand_aberrant_days = sum(candidate > cand_p95, na.rm = TRUE),
+        guid_aberrant_days = sum(guiding > guid_p95, na.rm = TRUE),
+        cand_aberrant_pct = (cand_aberrant_days / n_days) * 100,
+        guid_aberrant_pct = (guid_aberrant_days / n_days) * 100,
+        .groups = "drop"
+    ) %>%
+    mutate(geo_name = geo_to_name(geo_value)) %>%
+    arrange(desc(pmax(cand_aberrant_pct, guid_aberrant_pct)))
+
+if (nrow(aberrant_locs) > 0) {
+    DT::datatable(
+        aberrant_locs %>% select(geo_value, geo_name, cand_aberrant_pct, guid_aberrant_pct),
+        colnames = c(
+            "Geo-level",
+            "Name",
+            "% Time Above 95th (candidate)",
+            "% Time Above 95th (guiding)"
+        ),
+        caption = "Summary of aberrant locations (time spent in the extreme upper tail). Locations that are frequently aberrant in one indicator but not the other warrant closer inspection.",
+        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, pageLength = params$max_locations_table, dom = "tp")
+    ) %>% DT::formatRound(columns = 3:4, digits = 1)
+} else {
+    cat("Insufficient data to calculate aberrant time for these locations.\n\n")
+}
+```
+
+### Coverage and Missingness
+
+This section explores the availability of data across time and space. The step chart below tracks the number of geographic locations with valid data on any given date for the candidate indicator, the guiding indicator, and instances where both are available together. The dashed line indicates when both signals are available simultaneously. 
+
+```{r}
+#| label: eda-coverage
+#| echo: false
+#| results: asis
+coverage <- df %>%
+    group_by(time_value) %>%
+    summarize(
+        candidate_available = sum(!is.na(candidate)),
+        guiding_available = sum(!is.na(guiding)),
+        both_available = sum(!is.na(candidate) & !is.na(guiding)),
+        .groups = "drop"
+    )
+
+avg_both <- mean(coverage$both_available)
+max_locs <- max(coverage$guiding_available, coverage$candidate_available)
+cat(sprintf(
+    "On average, both indicators are simultaneously available in %.1f locations per %s.\n\n",
+    avg_both, env_time_type
+))
+```
+
+```{r}
+#| label: eda-coverage-plot
+#| echo: true
+
+ggplot(coverage, aes(x = time_value)) +
+    geom_step(aes(y = candidate_available, color = params$candidate_name), size = 0.7, direction = "mid") +
+    geom_step(aes(y = guiding_available, color = params$guiding_name), size = 0.7, direction = "mid") +
+    geom_step(aes(y = both_available, color = "Both"),
+        size = 0.7, linetype = "dashed", direction = "mid"
+    ) +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_y_continuous(labels = label_comma(), limits = c(0, NA)) +
+    scale_colour_manual(
+        values = dis_pal_list,
+        breaks = c(
+            params$guiding_name,
+            params$candidate_name, "Both"
+        )
+    ) +
+    labs(
+        title = "Data coverage over time",
+        subtitle = sprintf("Number of locations with non-missing values per %s", env_time_type),
+        x = "Date", y = "Number of locations", color = "Indicator"
+    )
+```
+
+#### Summary Statistics by Location
+
+This table summarizes the available data across all included locations. Locations with no candidate or guiding information are not considered.
+
+```{r}
+#| label: eda-summary
+#| results: asis
+#| echo: false
+# Compute base stats on the exhaustive geo-time grid
+summary_tbl_all <- df %>%
+    group_by(geo_value) %>%
+    summarize(
+        n_days = n(),
+        cand_mean = mean(candidate, na.rm = TRUE),
+        cand_var = var(candidate, na.rm = TRUE),
+        cand_miss_frac = mean(is.na(candidate)),
+        cand_miss = sprintf("%.1f%%", 100 * cand_miss_frac),
+        guide_mean = mean(guiding, na.rm = TRUE),
+        guide_var = var(guiding, na.rm = TRUE),
+        guide_miss_frac = mean(is.na(guiding)),
+        guide_miss = sprintf("%.1f%%", 100 * mean(is.na(guiding))),
+        .groups = "drop"
+    ) %>%
+    mutate(geo_name = geo_to_name(geo_value))
+
+format_excluded <- function(locs, names) {
+    if (length(locs) == 0) {
+        return(NULL)
+    }
+    sampled_idx <- match(interspersed_sample(locs), locs)
+    entries <- sprintf("%s (%s)", locs[sampled_idx], names[sampled_idx])
+    if (length(locs) > 15) {
+        paste0(paste(entries, collapse = ", "), ", etc.")
+    } else {
+        paste(entries, collapse = ", ")
+    }
+}
+
+excluded_locs_df <- summary_tbl_all %>%
+    filter(is.na(cand_mean) | cand_miss_frac == 1)
+if (nrow(excluded_locs_df) > 0) {
+    cat(sprintf(
+        "**Excluded locations (no candidate data)**: %s\n\n",
+        format_excluded(excluded_locs_df$geo_value, excluded_locs_df$geo_name)
+    ))
+}
+
+excluded_guide_locs_df <- summary_tbl_all %>%
+    filter(is.na(guide_mean) | guide_miss_frac == 1)
+if (nrow(excluded_guide_locs_df) > 0) {
+    cat(sprintf(
+        "**Excluded locations (no guiding data)**: %s\n\n",
+        format_excluded(excluded_guide_locs_df$geo_value, excluded_guide_locs_df$geo_name)
+    ))
+}
+
+zero_var_cand_locs_df <- summary_tbl_all %>%
+    filter(!is.na(cand_var) & cand_var == 0 & cand_miss_frac < 1)
+if (nrow(zero_var_cand_locs_df) > 0) {
+    cat(sprintf(
+        "**Zero variance locations (candidate flatlined)**: %s\n\n",
+        format_excluded(zero_var_cand_locs_df$geo_value, zero_var_cand_locs_df$geo_name)
+    ))
+}
+
+# Summary of missingness levels for all locations
+miss_levels <- summary_tbl_all %>%
+    mutate(
+        cand_miss_group = case_when(
+            cand_miss_frac == 1 ~ "100% missing",
+            cand_miss_frac < 0.05 ~ "<5% missing",
+            cand_miss_frac < 0.25 ~ "5-25% missing",
+            cand_miss_frac < 0.50 ~ "25-50% missing",
+            TRUE ~ "50-99.9% missing"
+        ),
+        cand_miss_group = factor(cand_miss_group, levels = c("<5% missing", "5-25% missing", "25-50% missing", "50-99.9% missing", "100% missing")),
+        guide_miss_group = case_when(
+            guide_miss_frac == 1 ~ "100% missing",
+            guide_miss_frac < 0.05 ~ "<5% missing",
+            guide_miss_frac < 0.25 ~ "5-25% missing",
+            guide_miss_frac < 0.50 ~ "25-50% missing",
+            TRUE ~ "50-99.9% missing"
+        ),
+        guide_miss_group = factor(guide_miss_group, levels = c("<5% missing", "5-25% missing", "25-50% missing", "50-99.9% missing", "100% missing"))
+    )
+
+cand_counts <- miss_levels %>%
+    count(cand_miss_group) %>%
+    complete(cand_miss_group, fill = list(n = 0))
+guide_counts <- miss_levels %>%
+    count(guide_miss_group) %>%
+    complete(guide_miss_group, fill = list(n = 0))
+
+cat("**Missingness Overview (All Locations):**\n\n")
+for (i in 1:nrow(cand_counts)) {
+    cat(sprintf(
+        "- **%s**: %d locations (Candidate) vs %d locations (Guiding)\n",
+        cand_counts$cand_miss_group[i],
+        cand_counts$n[i],
+        guide_counts$n[i]
+    ))
+}
+cat("\n")
+
+summary_tbl <- summary_tbl_all %>%
+    filter(
+        !is.na(cand_mean) & cand_miss_frac < 1,
+        !is.na(guide_mean) & guide_miss_frac < 1
+    ) %>%
+    arrange(desc(cand_miss_frac)) %>%
+    select(geo_value, geo_name, n_days, cand_mean, cand_miss, guide_mean, guide_miss)
+
+DT::datatable(
+    summary_tbl,
+    colnames = c(
+        sprintf("Geo-level (%s)", params$geo_type),
+        "Name",
+        sprintf("Total %s(s)", str_to_title(env_time_type)),
+        "Avg. Value (candidate)",
+        "% Missing (candidate)",
+        "Avg. Value (guiding)",
+        "% Missing (guiding)"
+    ),
+    caption = sprintf(
+        "Summary statistics by location. Missingness is calculated against the full analysis window (%d periods).",
+        as.integer(nrow(df) / n_locations)
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, pageLength = params$max_locations_table, dom = "tp")
+) %>% DT::formatRound(columns = c(4, 6), digits = 2)
+```
+
+```{r}
+#| label: eda-noise-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Noise Assessment\n\n")
+cat("We calculate the Coefficient of Variation (CV) for each location to compare signal stability across geographic areas.\n\n")
+cat("$$\\text{CV}_i = \\frac{\\text{SD}(X_i)}{|\\bar{X}_i|}$$\n\n")
+```
+
+```{r}
+#| label: eda-noise
+#| fig-height: 8
+#| eval: !expr n_inter_locations > 1
+
+# Calculate CV per location using the intersected data
+noise_stats <- df_inter %>%
+    arrange(geo_value, time_value) %>%
+    group_by(geo_value) %>%
+    summarize(
+        cand_cv = sd(candidate, na.rm = TRUE) /
+            abs(mean(candidate, na.rm = TRUE)),
+        guid_cv = sd(guiding, na.rm = TRUE) /
+            abs(mean(guiding, na.rm = TRUE)),
+        .groups = "drop"
+    ) %>%
+    # Remove locations where metrics couldn't be computed
+    filter(if_all(c(cand_cv, guid_cv), ~ is.finite(.x)))
+
+# Clip extreme outliers for robust visualization
+cv_upper <- quantile(c(noise_stats$cand_cv, noise_stats$guid_cv), 0.99, na.rm = TRUE)
+noise_stats_plot <- noise_stats %>%
+    filter(cand_cv <= cv_upper, guid_cv <= cv_upper)
+
+n_excluded <- nrow(noise_stats) - nrow(noise_stats_plot)
+
+# Summary Table
+noise_summary <- tibble(
+    Metric = "Coefficient of Variation (CV)",
+    `Median (candidate)` = median(noise_stats$cand_cv),
+    `Median (guiding)` = median(noise_stats$guid_cv),
+    `Median Difference` = median(noise_stats$cand_cv - noise_stats$guid_cv),
+    `% Smoother (candidate < guiding)` = mean(noise_stats$cand_cv < noise_stats$guid_cv) * 100
+)
+
+DT::datatable(noise_summary,
+    caption = sprintf(
+        "Comparative CV summary across locations.%s\nA negative Median Difference and high %% Smoother indicate the candidate is typically less volatile.",
+        if (n_excluded > 0) sprintf(" (%d extreme outlier(s) excluded from plots.)", n_excluded) else ""
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, paging = FALSE, dom = "t")
+) %>% DT::formatRound(columns = 2:5, digits = 3)
+
+# Reshape for plotting
+noise_long <- noise_stats_plot %>%
+    pivot_longer(-geo_value, names_to = "indicator", values_to = "value") %>%
+    mutate(
+        indicator = recode(indicator,
+            cand_cv = params$candidate_name,
+            guid_cv = params$guiding_name
+        )
+    )
+
+# Histogram comparison
+p_hist <- ggplot(noise_long, aes(x = value, fill = indicator)) +
+    geom_histogram(bins = 30, color = "white", alpha = 0.7, position = "identity") +
+    facet_wrap(~indicator, ncol = 1) +
+    scale_x_continuous(labels = label_percent()) +
+    labs(
+        title = "CV Distribution by Location",
+        subtitle = "Lower values indicate a more stable signal",
+        x = "Coefficient of Variation (CV)", y = "Count", fill = "Indicator"
+    ) +
+    theme(legend.position = "top")
+
+# Paired Scatter Plot
+p_scatter <- ggplot(noise_stats_plot, aes(x = guid_cv, y = cand_cv)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_point(aes(color = cand_cv < guid_cv), alpha = 0.7, size = 2) +
+    scale_x_continuous(labels = label_percent()) +
+    scale_y_continuous(labels = label_percent()) +
+    scale_color_manual(
+        name = "Result",
+        values = c("TRUE" = dis_pal_list[2], "FALSE" = dis_pal_list[4]),
+        labels = c("TRUE" = "Candidate More Stable", "FALSE" = "Guiding More Stable")
+    ) +
+    labs(
+        title = "Paired CV Comparison",
+        subtitle = "Points below the dashed line represent locations where the candidate is more stable.",
+        x = sprintf("CV: %s (Guiding)", params$guiding_name),
+        y = sprintf("CV: %s (Candidate)", params$candidate_name)
+    )
+
+p_hist / p_scatter + plot_layout(heights = c(1.2, 1))
+```
+
+```{r}
+#| label: revision-analysis-setup
+#| echo: false
+
+# Get versioned data
+archive <- NULL
+archive_has_history <- FALSE
+if (!is.null(candidate_archive) &&
+    n_distinct(candidate_archive$DT$version) > 1) {
+    archive <- candidate_archive
+    archive_span_days <- as.numeric(
+        max(archive$DT$version) - min(archive$DT$version),
+        units = "days"
+    )
+    archive_has_history <- archive_span_days >= 60
+}
+```
+
+### Candidate Versioning
+
+```{r}
+#| label: revision-analysis-text
+#| echo: false
+#| results: asis
+if (is.null(archive)) {
+    cat(sprintf(
+        "No version history is available for `%s / %s` — versioning analysis is skipped.\n\n",
+        params$candidate_source, params$candidate_signal
+    ))
+} else if (!archive_has_history) {
+    version_start <- min(archive$DT$version)
+    cat(sprintf(
+        "Versioning began on %s. At least 60 days of version history are needed for meaningful revision analysis; the earliest this will be possible is %s.\n\n",
+        format(version_start), format(version_start + 60)
+    ))
+    cat(sprintf(
+        "Current versions: %s.\n\n",
+        paste(sort(unique(archive$DT$version)), collapse = ", ")
+    ))
+} else {
+    cat("> The `revision_summary` is under revision and may produce misleading results in certain edge cases. Use the summary statistics below with caution while development is ongoing.\n\n")
+
+    if (exists("archive_info") && !is.null(archive_info)) {
+        cat(sprintf(
+            "Revision analysis is performed on a sample of %d out of %d locations, with versions from %s to %s, and time from %s to %s. Time values have been truncated to the earliest version to avoid spurious lags. \n\n",
+            archive_info$n_sampled, archive_info$n_total, archive_info$version_start, archive_info$version_end, archive_info$time_value_start, archive_info$time_value_end
+        ))
+    }
+    # Summarize revision behavior
+    filtered_archive <-
+        archive$DT %>%
+        filter(time_value >= min(version)) %>%
+        as_epi_archive()
+    rev_details <- revision_summary(filtered_archive)
+
+    # Manual detailed summary based on print.rev_details
+    rev_beh <- rev_details$revision_behavior
+    total_obs <- nrow(rev_beh)
+
+    cat(sprintf(
+        "- **Time range**: %s to %s\n",
+        rev_details$range_time_values[1], rev_details$range_time_values[2]
+    ))
+
+    # Min lag stats
+    lag_stats <- summary(as.numeric(rev_beh$min_lag, units = "days"))
+    cat("- **Min lag (days to first version)**: ")
+    cat(paste(names(lag_stats), round(as.numeric(lag_stats), 1), sep = ": ", collapse = ", "), "\n")
+
+    # Thresholds
+    quick_threshold <- 3 # days
+    few_threshold <- 3 # revisions
+    rel_spread_threshold <- 0.1
+    abs_spread_threshold <- 0.05 * rev_details$max_val
+
+    # Frequencies
+    no_rev_pct <- mean(rev_beh$n_revisions == 0)
+    quick_rev_pct <- mean(as.numeric(rev_beh$max_lag, units = "days") <= quick_threshold)
+    few_rev_pct <- mean(rev_beh$n_revisions <= few_threshold)
+    cat(sprintf("- **Total number of revisions**: %d\n", n_distinct(archive$DT$version)))
+    cat(sprintf("- **No revisions**: %s\n", label_percent()(no_rev_pct)))
+    cat(sprintf("- **Quick revisions (<= %d days)**: %s\n", quick_threshold, label_percent()(quick_rev_pct)))
+    cat(sprintf("- **Few revisions (<= %d)**: %s\n", few_threshold, label_percent()(few_rev_pct)))
+
+    # Magnitude for revised ones
+    revised_beh <- rev_beh %>% filter(n_revisions > 0)
+    if (nrow(revised_beh) > 0) {
+        low_rel_spread_pct <- mean(revised_beh$rel_spread < rel_spread_threshold, na.rm = TRUE)
+        high_abs_spread_pct <- mean(revised_beh$spread > abs_spread_threshold, na.rm = TRUE)
+
+        cat(sprintf(
+            "- **Minor relative revisions (< %.1f)**: %s\n",
+            rel_spread_threshold, label_percent()(low_rel_spread_pct)
+        ))
+        cat(sprintf(
+            "- **Major absolute revisions (> %.3f)**: %s\n",
+            abs_spread_threshold, label_percent()(high_abs_spread_pct)
+        ))
+    }
+
+    cat(sprintf("- **Days until within %d%% of latest**: ", rev_details$within_latest * 100))
+    conv_stats <- summary(as.numeric(rev_beh$lag_near_latest, units = "days"))
+    cat(paste(names(conv_stats), round(as.numeric(conv_stats), 1), sep = ": ", collapse = ", "), "\n\n")
+}
+```
+
+```{r}
+#| label: revision-analysis-visuals-text
+#| echo: false
+#| results: asis
+#| eval: !expr (archive_has_history && n_inter_locations > 1)
+
+cat(sprintf("The time series below visualize the candidate indicator (%s) with line colors corresponding to the issue date, meaning the date the data was initially published or subsequently revised. Darker colors denote older versions, while lighter colors represent more recent updates.\n\n", params$candidate_name))
+cat("If the lines perfectly overlap, it means the data for that location is not subject to revisions. Where you see a vertical spread along a single date on the x-axis, the data has been revised over time. Consistent under-reporting or over-reporting in earlier issue dates helps to identify potential biases in the most recent data. Models trained on finalized retrospective data can struggle in real-time if they have to rely on preliminary, unrevised values.\n\n")
+```
+
+```{r}
+#| label: revision-analysis-visuals
+#| eval: !expr archive_has_history
+#| results: asis
+#| fig-width: 10
+#| fig-height: 10
+
+rev_by_loc <- rev_details$revision_behavior %>%
+    filter(n_revisions != 0) %>%
+    group_by(geo_value) %>%
+    summarize(
+        n_versions = n(),
+        n_rev = mean(n_revisions, na.rm = TRUE),
+        min_lag = min(min_lag, na.rm = TRUE),
+        max_lag = max(max_lag, na.rm = TRUE),
+        spread = mean(spread, na.rm = TRUE),
+        rel_spread = mean(rel_spread, na.rm = TRUE),
+        lag_near_latest = mean(lag_near_latest, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    arrange(desc(rel_spread))
+
+if (nrow(rev_by_loc) > 0) {
+    # Render the table limited to max_locations_table
+    DT::datatable(rev_by_loc,
+        colnames = c(
+            "Location", "Versions", "Avg. Revisions", "Min Lag", "Max Lag",
+            "Avg. Spread", "Avg. Rel. Spread", "Lag Near Latest"
+        ),
+        caption = "Candidate revision behavior by location",
+        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, pageLength = params$max_locations_table, dom = "tp")
+    ) %>% DT::formatRound(columns = 2:8, digits = 2)
+}
+
+if (nrow(rev_by_loc) > 0 && n_inter_locations > 1) {
+    # Pick a few locations with the most revisions
+    rev_geos <- head(rev_by_loc$geo_value, params$max_locations_plot)
+    # Limit number of locations for autoplot to avoid overcrowding
+    # Limit to last 2 years for clarity
+    archive_sample <- archive %>%
+        filter(geo_value %in% rev_geos) %>%
+        filter(time_value >= max(time_value) - years(1))
+
+    autoplot(archive_sample, .versions = "month") +
+        scale_colour_viridis_c(
+            option = "plasma",
+            begin = 0, end = 0.8,
+            labels = scales::label_date(),
+            trans = "date"
+        ) +
+        facet_wrap(~geo_value, ncol = 2, scales = "free_y") +
+        guides(colour = guide_colorbar(title = "Issue Date", barwidth = 25, barheight = 0.5)) +
+        labs(
+            title = "Candidate Signal Revisions",
+            subtitle = "Showing monthly version snapshots for the most recent year of data",
+            x = "Observation Date",
+            y = "Value"
+        ) +
+        theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+}
+```
+
+### Signal sanity checks
+
+This section is by its nature more difficult than others to do systematically. Things to look for:
+
+- If it's a percentile, is it between 0 and 100?
+- If it's a rate, is it roughly proportional to population? *(requires external population data — inspect manually)*
+- Are the actual values reasonable? E.g. if it's a percentage, does it ever approach 100 outside of literal pandemics?
+- If it's for a seasonal disease, are rates highest in the winter and lowest in the summer?
+- Are geo-aggregated coarser levels plausible aggregations? *(checked below for state-level signals vs HHS/nation)*
+
+```{r}
+#| label: sanity-value-range
+#| fig-height: 4
+
+ggplot(df_inter, aes(x = candidate)) +
+    geom_histogram(bins = 40, alpha = 0.8, color = "white") +
+    scale_x_continuous(labels = label_comma()) +
+    labs(
+        title = sprintf("Value distribution: %s", params$candidate_name),
+        subtitle = sprintf(
+            "%s observations across %d locations",
+            label_comma()(nrow(df_inter)), n_inter_locations
+        ),
+        x = "Value", y = "Count"
+    )
+```
+
+```{r}
+#| label: sanity-value-range-table
+#| echo: false
+
+range_tbl <- df_inter %>%
+    group_by(geo_value) %>%
+    summarize(
+        n        = n(),
+        min      = min(candidate, na.rm = TRUE),
+        p05      = quantile(candidate, 0.05, na.rm = TRUE),
+        median   = median(candidate, na.rm = TRUE),
+        p95      = quantile(candidate, 0.95, na.rm = TRUE),
+        max      = max(candidate, na.rm = TRUE),
+        .groups  = "drop"
+    ) %>%
+    arrange(desc(max))
+
+DT::datatable(
+    range_tbl,
+    colnames = c("Location", "N", "Min", "5th pct", "Median", "95th pct", "Max"),
+    caption = sprintf(
+        "Value range per location for %s. Sort by Min or Max to surface potential out-of-bounds values.",
+        params$candidate_name
+    ),
+    rownames = FALSE,
+    options = list(
+        scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+        paging = TRUE, pageLength = params$max_locations_table, dom = "tp"
+    )
+) %>% DT::formatRound(columns = 3:7, digits = 3)
+```
+
+```{r}
+#| label: sanity-seasonality
+#| fig-height: 7
+#| eval: !expr as.numeric(difftime(max(df_inter$time_value), min(df_inter$time_value), units = "days")) >= 365
+
+season_month_labels <- c("Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May")
+
+df_seasonal <- df_inter %>%
+    mutate(
+        yr = as.integer(format(time_value, "%Y")),
+        month = as.integer(format(time_value, "%m")),
+        season_start = if_else(month >= 6L, yr, yr - 1L),
+        season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
+        season_month = if_else(month >= 6L, month - 5L, month + 7L)
+    ) %>%
+    group_by(season, season_month) %>%
+    summarize(
+        median_val = median(candidate, na.rm = TRUE),
+        min_val    = min(candidate, na.rm = TRUE),
+        max_val    = max(candidate, na.rm = TRUE),
+        p25        = quantile(candidate, 0.25, na.rm = TRUE),
+        p75        = quantile(candidate, 0.75, na.rm = TRUE),
+        .groups    = "drop"
+    ) %>%
+    filter(season %in% (count(., season) %>% filter(n >= 3) %>% pull(season)))
+
+ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group = season)) +
+    geom_ribbon(aes(ymin = min_val, ymax = max_val), alpha = 0.10, linewidth = 0.2) +
+    geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.30, linewidth = 0.3) +
+    geom_line(aes(y = median_val), size = 0.8) +
+    geom_point(aes(y = median_val), size = 1.5) +
+    facet_wrap(~season, ncol = 2, scales = "free_y") +
+    scale_x_continuous(breaks = 1:12, labels = season_month_labels) +
+    scale_y_continuous(labels = label_comma()) +
+    labs(
+        title = sprintf("Seasonal pattern: %s", params$candidate_name),
+        subtitle = "Median by month across all locations — inner band: IQR, outer band: full range",
+        x = "Month", y = "Median value"
+    ) +
+    theme(legend.position = "none")
+```
+
+```{r}
+#| label: sanity-geo-aggregation
+#| echo: false
+#| results: asis
+#| eval: !expr params$geo_type == "state"
+
+pacman::p_load(nanoparquet)
+
+crosswalk_path <- here("tests", "test_data", "delphi_geomap", "geomapper_crosswalk_20200101.parquet")
+crosswalk <- tryCatch(
+    {
+        nanoparquet::read_parquet(crosswalk_path) %>%
+            distinct(state_geo = state_abbr, hhs_region = as.character(hhs))
+    },
+    error = function(e) {
+        # Fallback to standard HHS region mapping if the file is missing
+        tibble(
+            state_geo = c(
+                "CT", "ME", "MA", "NH", "RI", "VT",
+                "NJ", "NY", "PR", "VI",
+                "DE", "DC", "MD", "PA", "VA", "WV",
+                "AL", "FL", "GA", "KY", "MS", "NC", "SC", "TN",
+                "IL", "IN", "MI", "MN", "OH", "WI",
+                "AR", "LA", "NM", "OK", "TX",
+                "IA", "KS", "MO", "NE",
+                "CO", "MT", "ND", "SD", "UT", "WY",
+                "AZ", "CA", "HI", "NV", "AS", "GU", "MP",
+                "AK", "ID", "OR", "WA"
+            ),
+            hhs_region = c(
+                rep("1", 6),
+                rep("2", 4),
+                rep("3", 6),
+                rep("4", 8),
+                rep("5", 6),
+                rep("6", 5),
+                rep("7", 4),
+                rep("8", 6),
+                rep("9", 7),
+                rep("10", 4)
+            )
+        )
+    }
+)
+
+is_pct_signal <- grepl("%|pct", params$candidate_name, ignore.case = TRUE)
+
+fetch_coarser_candidate <- function(geo_type_coarser) {
+    tryCatch(
+        pub_covidcast(
+            params$candidate_source, params$candidate_signal,
+            geo_type_coarser, params$time_type,
+            time_values = time_range(params$start_day, params$end_day),
+            as_of = Sys.Date()
+        ) %>% select(time_value, geo_value, coarser_val = value),
+        error = function(e) NULL
+    )
+}
+
+state_vals <- df_candidate %>%
+    as_tibble() %>%
+    select(time_value, state_geo = geo_value, state_val = value)
+
+check_aggregation <- function(df_coarser, group_label, state_to_coarser) {
+    if (is.null(df_coarser)) {
+        return(NULL)
+    }
+
+    state_bounds <- state_vals %>%
+        inner_join(state_to_coarser, by = "state_geo") %>%
+        group_by(time_value, coarser_geo) %>%
+        summarize(
+            state_min = min(state_val, na.rm = TRUE),
+            state_max = max(state_val, na.rm = TRUE),
+            n_states  = n(),
+            .groups   = "drop"
+        )
+
+    df_coarser %>%
+        rename(coarser_geo = geo_value) %>%
+        inner_join(state_bounds, by = c("time_value", "coarser_geo")) %>%
+        filter(!is.na(coarser_val) & (coarser_val < state_min - 1e-9 | coarser_val > state_max + 1e-9)) %>%
+        mutate(
+            geo_level = group_label,
+            direction = if_else(coarser_val < state_min, "below min", "above max")
+        ) %>%
+        select(geo_level, time_value, coarser_geo, coarser_val, state_min, state_max, direction, n_states)
+}
+
+df_hhs_raw <- fetch_coarser_candidate("hhs")
+df_nation_raw <- fetch_coarser_candidate("nation")
+
+hhs_map <- crosswalk %>% select(state_geo, coarser_geo = hhs_region)
+nation_map <- crosswalk %>%
+    distinct(state_geo) %>%
+    mutate(coarser_geo = "us")
+
+violations <- bind_rows(
+    check_aggregation(df_hhs_raw, "HHS", hhs_map),
+    check_aggregation(df_nation_raw, "Nation", nation_map)
+)
+
+unavailable <- c(
+    if (is.null(df_hhs_raw)) "HHS" else NULL,
+    if (is.null(df_nation_raw)) "Nation" else NULL
+)
+
+if (length(unavailable) > 0) {
+    cat(sprintf(
+        "**Note**: %s-level data not available for %s / %s.\n\n",
+        paste(unavailable, collapse = " and "),
+        params$candidate_source, params$candidate_signal
+    ))
+}
+
+if (nrow(violations) == 0) {
+    cat(sprintf(
+        "No geo-aggregation violations found: all HHS/nation values are within the [min, max] of constituent state values for %s.\n",
+        params$candidate_name
+    ))
+} else {
+    cat(sprintf(
+        "**%d observations** where the aggregated value falls outside the [min, max] of its constituent states (%s signal):\n\n",
+        nrow(violations),
+        if (is_pct_signal) "percentage" else "non-percentage"
+    ))
+    print(htmltools::tagList(
+        DT::datatable(
+            violations,
+            colnames = c("Level", "Date", "Geo", "Agg Value", "State Min", "State Max", "Direction", "N States"),
+            caption = sprintf(
+                "Geo-aggregation bounds check for %s. Aggregated values should fall within [min, max] of constituent state values.",
+                params$candidate_name
+            ),
+            rownames = FALSE,
+            options = list(
+                scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+                paging = TRUE, pageLength = 20, dom = "tp"
+            )
+        ) %>% DT::formatRound(columns = 4:6, digits = 3)
+    ))
+}
+```
+
+```{r}
+#| label: sanity-seasonality-anomalies
+#| echo: false
+#| eval: !expr as.numeric(difftime(max(df_inter$time_value), min(df_inter$time_value), units = "days")) >= 365
+
+df_seasonal_loc <- df_inter %>%
+    mutate(
+        yr           = as.integer(format(time_value, "%Y")),
+        month        = as.integer(format(time_value, "%m")),
+        season_start = if_else(month >= 6L, yr, yr - 1L),
+        season       = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L))
+    ) %>%
+    group_by(season, geo_value) %>%
+    summarize(loc_max = max(candidate, na.rm = TRUE), .groups = "drop")
+
+typical_max <- df_seasonal_loc %>%
+    group_by(season) %>%
+    summarize(typical_max = median(loc_max, na.rm = TRUE), .groups = "drop")
+
+anomalies <- df_seasonal_loc %>%
+    left_join(typical_max, by = "season") %>%
+    mutate(ratio = loc_max / typical_max) %>%
+    filter(ratio >= 2) %>%
+    arrange(desc(ratio)) %>%
+    select(season, geo_value, loc_max, typical_max, ratio)
+
+if (nrow(anomalies) == 0) {
+    cat("No locations found with a seasonal max more than 2x the typical (median) seasonal max.")
+} else {
+    DT::datatable(
+        anomalies,
+        colnames = c("Season", "Location", "Location Max", "Typical Max", "Ratio"),
+        caption = sprintf(
+            "Locations where seasonal max exceeds 2x the typical (median) seasonal max for %s.",
+            params$candidate_name
+        ),
+        rownames = FALSE,
+        options = list(
+            scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+            paging = TRUE, pageLength = 20, dom = "tp"
+        )
+    ) %>% DT::formatRound(columns = 3:5, digits = 3)
+}
+```
+
+---
+
+## Correlation Analysis {#correlation}
+
+All correlation metrics are computed on the intersection of the candidate and guiding indicators (rows where both values are non-missing) using the latest available revisions for both signals.
+
+```{r}
+#| label: cor-geo-over-time-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Correlation over Time\n\n")
+cat("Here we calculate the Spearman rank correlation between the candidate and guiding indicators across all available locations for each individual date. We also overlay a LOESS smoothed trend line to help capture broader patterns over time.\n\n")
+cat("Values near one tell us there is a strong positive correlation across areas on that specific day. When you see dips or sustained drops in the line, it suggests that the candidate decoupled from the guiding indicator during that period, perhaps due to underlying dynamics. This helps us see if the spatial relationship is stable. A reliable candidate indicator should maintain a fairly consistent correlation. The quantile trends from above are included for comparison across time.\n\n")
+```
+
+```{r}
+#| label: cor-geo-over-time
+if (n_inter_locations > 1) {
+    cor_by_time <- epi_cor(df_inter, candidate, guiding,
+        cor_by = time_value, method = "spearman"
+    )
+
+    mean_rho <- mean(cor_by_time$cor, na.rm = TRUE)
+
+    p_cor <- ggplot(cor_by_time, aes(x = time_value)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+        geom_hline(
+            yintercept = c(0.3, 0.4, 0.6, 0.7, 0.8, 0.9),
+            linetype = "dotted", color = "gray85", size = 0.3
+        ) +
+        geom_line(aes(y = cor, color = "Correlation"), size = 0.8) +
+        geom_smooth(aes(y = cor, color = "LOESS smoothed trend"),
+            method = "loess", span = 0.2, se = TRUE,
+            fill = dis_pal_list[2], alpha = 0.15
+        ) +
+        scale_x_date(
+            limits = range(cor_by_time$time_value, na.rm = TRUE),
+            breaks = breaks_pretty(n = 6), label = label_date_short()
+        ) +
+        scale_y_continuous(
+            name = expression(paste("Spearman ", rho)),
+            limits = c(0, 1),
+            breaks = c(0, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0)
+        ) +
+        scale_color_manual(
+            name = "Metric",
+            values = c(
+                "Correlation" = dis_pal_list[1],
+                "LOESS smoothed trend" = dis_pal_list[2]
+            )
+        ) +
+        labs(
+            title = "Correlation over time",
+            subtitle = bquote(Spearman ~ rho ~ "across" ~ .(n_inter_locations) ~ "locations | Mean =" ~ .(sprintf("%.3f", mean_rho))),
+            x = "Date", y = expression(paste("Spearman ", rho, " across locations"))
+        ) +
+        theme(
+            legend.position = "none",
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank()
+        )
+}
+```
+
+```{r}
+#| label: cor-geo-over-time-quant-plot
+#| include: false
+#| eval: !expr (n_inter_locations > 1 && exists("df_quantiles_wide"))
+
+pal_cand <- dis_pal_list[2]
+pal_guid <- dis_pal_list[3]
+
+df_quantiles_norm <- df_quantiles_wide %>%
+    filter(geo_value %in% c("candidate", "guiding")) %>%
+    group_by(geo_value) %>%
+    mutate(
+        norm_scale = max(`0.95`),
+        across(
+            c(`0.05`, `0.25`, `0.5`, `0.75`, `0.95`),
+            ~ . / norm_scale
+        )
+    ) %>%
+    ungroup()
+
+df_cand_q <- df_quantiles_norm %>% filter(geo_value == "candidate")
+df_guid_q <- df_quantiles_norm %>% filter(geo_value == "guiding")
+
+p_quant <- ggplot(mapping = aes(x = time_value)) +
+    geom_ribbon(data = df_guid_q, aes(ymin = `0.05`, ymax = `0.95`), fill = pal_guid, alpha = 0.10) +
+    geom_ribbon(data = df_guid_q, aes(ymin = `0.25`, ymax = `0.75`), fill = pal_guid, alpha = 0.25) +
+    geom_line(data = df_guid_q, aes(y = `0.5`, color = params$guiding_name), size = 1) +
+    geom_ribbon(data = df_cand_q, aes(ymin = `0.05`, ymax = `0.95`), fill = pal_cand, alpha = 0.10) +
+    geom_ribbon(data = df_cand_q, aes(ymin = `0.25`, ymax = `0.75`), fill = pal_cand, alpha = 0.25) +
+    geom_line(data = df_cand_q, aes(y = `0.5`, color = params$candidate_name), size = 1) +
+    scale_x_date(
+        limits = range(cor_by_time$time_value, na.rm = TRUE),
+        breaks = breaks_pretty(n = 6), label = label_date_short()
+    ) +
+    scale_color_manual(values = setNames(c(pal_guid, pal_cand), c(params$guiding_name, params$candidate_name))) +
+    labs(
+        subtitle = "Smoothed Quantile Trends (standardised per indicator for shape comparison)",
+        x = NULL, y = "Standardised value",
+        color = "Indicator"
+    ) +
+    theme(
+        legend.position = "top",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()
+    )
+```
+
+```{r}
+#| label: cor-geo-over-time-cor-plot
+#| eval: !expr n_inter_locations > 1
+
+p_cor <- ggplot(cor_by_time, aes(x = time_value)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_hline(
+        yintercept = c(0.3, 0.4, 0.6, 0.7, 0.8, 0.9),
+        linetype = "dotted", color = "gray85", size = 0.3
+    ) +
+    geom_line(aes(y = cor, color = "Correlation"), size = 0.8) +
+    geom_smooth(aes(y = cor, color = "LOESS smoothed trend"),
+        method = "loess", span = 0.2, se = TRUE,
+        fill = dis_pal_list[2], alpha = 0.15
+    ) +
+    scale_x_date(
+        limits = range(cor_by_time$time_value, na.rm = TRUE),
+        breaks = breaks_pretty(n = 6), label = label_date_short()
+    ) +
+    scale_y_continuous(
+        name = expression(paste("Spearman ", rho)),
+        limits = c(0, 1),
+        breaks = c(0, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0)
+    ) +
+    scale_color_manual(
+        name = "Metric",
+        values = c(
+            "Correlation" = dis_pal_list[1],
+            "LOESS smoothed trend" = dis_pal_list[2]
+        )
+    ) +
+    labs(
+        title = "Diagnostic Comparison: Correlation, Quantiles, and Coverage",
+        subtitle = bquote("Correlation over time | Mean" ~ rho == .(sprintf("%.3f", mean_rho)) ~ "(latest revisions)"),
+        x = NULL
+    ) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()
+    )
+```
+
+```{r}
+#| label: cor-geo-over-time-cov-plot
+#| include: false
+#| eval: !expr n_inter_locations > 1
+
+p_cov <- ggplot(coverage, aes(x = time_value, y = both_available)) +
+    geom_step(color = "gray50", size = 0.5, direction = "mid") +
+    scale_x_date(
+        limits = range(cor_by_time$time_value, na.rm = TRUE),
+        breaks = breaks_pretty(n = 6), label = label_date_short()
+    ) +
+    scale_y_continuous(labels = label_comma(), name = "Locations") +
+    labs(
+        subtitle = "Geographic coverage (number of locations participating)",
+        x = "Date"
+    ) +
+    theme(panel.grid.minor = element_blank())
+```
+
+```{r}
+#| label: cor-geo-over-time-stacked
+#| fig-height: 10
+#| eval: !expr n_inter_locations > 1
+
+p_cor / p_quant / p_cov + plot_layout(heights = c(1.4, 0.8, 0.8))
+```
+
+
+
+```{r}
+#| label: cor-temporal-dist-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Distribution of Temporal Correlations\n\n")
+cat("These histograms show the distribution of the Spearman correlation and its squared value across the entire time period, computed separately for each geographic location. The median value is marked with a dashed line.\n\n")
+cat("If the distribution is heavily skewed to the right, toward one, it means the candidate generally tracks the guiding indicator well over time for most locations. Conversely, a wide spread or multiple peaks suggests that the candidate's performance depends heavily on the specific area. While the previous section looked at spatial correlation on a daily basis, these plots summarize how well the two signals match within individual locations.\n\n")
+```
+
+```{r}
+#| label: cor-temporal-dist
+cor_by_geo <- epi_cor(df_inter, candidate, guiding,
+    cor_by = geo_value, method = "spearman"
+)
+
+med_rho <- median(cor_by_geo$cor, na.rm = TRUE)
+
+if (n_inter_locations > 1) {
+    p_rho <- ggplot(cor_by_geo, aes(x = cor)) +
+        geom_histogram(bins = 20, alpha = 0.6, color = "white") +
+        geom_vline(
+            xintercept = med_rho, linetype = "dashed",
+            color = dis_pal_list[2], size = 1
+        ) +
+        scale_x_continuous(breaks = breaks_pretty()) +
+        labs(
+            subtitle = bquote(Median ~ Spearman ~ (rho) == .(sprintf("%.3f", med_rho)) ~ "across" ~ .(nrow(cor_by_geo)) ~ "locations"),
+            x = expression(Spearman ~ rho), y = "Count"
+        )
+
+    p_r2 <- ggplot(cor_by_geo, aes(x = cor^2)) +
+        geom_histogram(bins = 20, alpha = 0.6, color = "white") +
+        scale_x_continuous(breaks = breaks_pretty()) +
+        labs(
+            subtitle = bquote(Median ~ rho^2 == .(sprintf("%.3f", median(cor_by_geo$cor^2, na.rm = TRUE)))),
+            x = expression(rho^2), y = "Count"
+        )
+
+    (p_rho + p_r2) + plot_annotation(title = "Distribution of intra-location temporal correlations")
+} else {
+    cat(sprintf("For the single location %s, the temporal Spearman correlation is %.3f\n", unique(df_inter$geo_value)[1], med_rho))
+}
+```
+
+```{r}
+#| label: cor-lagged-time-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Lagged Correlations\n\n")
+cat(sprintf("To explore lead and lag relationships, we shift the candidate signal by various intervals (%s %s). Specifically, a positive lag (e.g., +7 days) compares the candidate signal from 7 days ago against the guiding signal today. This allows us to see if the candidate acts as a leading indicator.\n\n", paste(lag_values, collapse = ", "), time_unit))
+cat(sprintf("#### Correlation over time, at different %s\n\n", time_unit))
+cat("This plot expands on the basic correlation by showing multiple smoothed trend lines, each representing a different lag applied to the candidate. If the curve for a positive lag is consistently higher than the zero-lag curve, it is a strong indication that the candidate indicator provides a lead over the guiding signal. This helps us verify whether that leading relationship is stable throughout the time period.\n\n")
+```
+
+```{r}
+#| label: cor-lagged-time
+#| fig-height: 8
+
+cor_lagged_time <- map(lag_values, ~ {
+    epi_cor(df_inter, candidate, guiding,
+        cor_by = time_value, dt1 = -.x, method = "spearman"
+    ) %>%
+        mutate(lag = .x)
+}) %>%
+    list_rbind() %>%
+    mutate(lag = as.factor(lag))
+
+if (n_inter_locations > 1) {
+    ggplot(cor_lagged_time, aes(x = time_value, y = cor, color = lag)) +
+        geom_line(alpha = 0.4) +
+        geom_smooth(method = "loess", span = 0.2, se = FALSE, size = 1.2) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+        scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+        scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
+        labs(
+            title = sprintf("Correlation over time at different %s", time_unit),
+            subtitle = "Transparent line: Raw Correlation, Solid line: LOESS smoothed trend",
+            x = "Date", y = expression(paste("Spearman ", rho)),
+            color = lag_unit_label
+        ) +
+        guides(color = guide_legend(nrow = 1, override.aes = list(linewidth = 1.5, alpha = 1)))
+}
+```
+
+```{r}
+#| label: cor-lagged-realtime-text
+#| echo: false
+#| results: asis
+#| eval: !expr archive_has_history && n_inter_locations > 1
+cat("#### Real-time lagged correlations\n\n")
+cat(sprintf("Same as above, but the candidate (%s) values are drawn from `epix_as_of(candidate_archive, v)` at each version date `v`, so the correlation reflects what was observable in real time rather than using the final revised values.\n\n", params$candidate_name))
+```
+
+```{r}
+#| label: cor-lagged-realtime
+#| fig-height: 8
+#| eval: !expr (archive_has_history && n_inter_locations > 1)
+
+versions <- sort(unique(candidate_archive$DT$version))
+
+cor_lagged_realtime <- map_dfr(versions, function(vv) {
+    snap <- epix_as_of(candidate_archive, vv)
+    latest_tv <- max(snap$time_value, na.rm = TRUE)
+    map_dfr(lag_values, function(lg) {
+        target_tv <- switch(env_time_type,
+            week  = latest_tv - lubridate::weeks(lg),
+            month = latest_tv - lubridate::months(lg),
+            year  = latest_tv - lubridate::years(lg),
+            latest_tv - lg
+        )
+        df_cand <- snap %>%
+            filter(time_value == target_tv) %>%
+            rename(candidate = value)
+        df_guid <- df_guiding %>%
+            filter(time_value == latest_tv) %>%
+            select(geo_value, guiding = value)
+        df_joined <- inner_join(df_cand, df_guid, by = "geo_value")
+        if (n_distinct(df_joined$geo_value) < 3) {
+            return(tibble(version = vv, lag = lg, cor = NA_real_))
+        }
+        tibble(version = vv, lag = lg, cor = cor(df_joined$candidate, df_joined$guiding,
+            method = "spearman", use = "complete.obs"
+        ))
+    })
+}) %>%
+    mutate(lag = as.factor(lag))
+
+ggplot(cor_lagged_realtime, aes(x = version, y = cor, color = lag)) +
+    geom_line(alpha = 0.4) +
+    geom_smooth(method = "loess", span = 0.2, se = FALSE, size = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
+    labs(
+        title = sprintf("Real-time correlation over time at different %s", time_unit),
+        subtitle = "Candidate values as-published at each version date",
+        x = "Version date", y = expression(paste("Spearman ", rho)),
+        color = lag_unit_label
+    ) +
+    guides(color = guide_legend(nrow = 1, override.aes = list(linewidth = 1.5, alpha = 1)))
+```
+
+```{r}
+#| label: cor-lagged-dist-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("#### Per-location temporal correlation distributions, at different lags\n\n")
+cat("Here we show density distributions of the temporal Spearman correlations for each location, calculated across several different lead and lag shifts. \n\n")
+cat("The goal is to see which density curve has the highest correlation values. The lag associated with that curve is the one that best aligns the temporal dynamics of the two indicators for the majority of areas. This complements the previous plot by confirming whether the optimal lag remains consistent over time within individual locations.\n\n")
+```
+
+```{r}
+#| label: cor-lagged-dist
+cor_lagged_geo <- map(lag_values, ~ {
+    epi_cor(df_inter, candidate, guiding,
+        cor_by = geo_value, dt1 = -.x, method = "spearman"
+    ) %>%
+        mutate(lag = .x)
+}) %>%
+    list_rbind() %>%
+    mutate(lag = as.factor(lag))
+
+if (n_inter_locations > 1) {
+    ggplot(cor_lagged_geo, aes(x = cor)) +
+        geom_density(aes(fill = lag, color = lag), alpha = 0.15) +
+        xlim(-1, 1) +
+        labs(
+            title = sprintf("Temporal correlations at different %s", time_unit),
+            subtitle = "Positive lag = candidate leads the guiding indicator",
+            x = expression(paste("Spearman ", rho)), y = "Density",
+            fill = lag_unit_label, color = lag_unit_label
+        ) +
+        guides(
+            fill = guide_legend(override.aes = list(alpha = 0.35))
+        )
+}
+```
+
+```{r}
+#| label: cor-lag-sweep-text
+#| echo: false
+#| results: asis
+#| eval: !expr n_inter_locations > 1
+cat("### Systematic Lag Analysis\n\n")
+cat(sprintf("In this section, we sweep through a wider range of lags (from %d to %d %s) to pinpoint the optimal lead time.\n\n", min(lags_sweep), max(lags_sweep), time_unit))
+cat("The plot displays summary statistics like the mean, median, and interquartile range of the temporal correlations across all locations, calculated for every possible lag in the window. A vertical line marks the optimal lag, which has the highest mean correlation.\n\n")
+cat("If the optimal lag is positive, it means the candidate's past values are most predictive of the guiding indicator's current values, making it valuable for forecasting.\n\n")
+```
+
+```{r}
+#| label: cor-lag-sweep
+lags <- lags_sweep
+
+cor_sweep <- map(lags, ~ {
+    epi_cor(df_inter, candidate, guiding,
+        cor_by = geo_value, dt1 = -.x, method = "spearman"
+    ) %>%
+        mutate(lag = .x)
+}) %>% list_rbind()
+
+lag_summary <- cor_sweep %>%
+    group_by(lag) %>%
+    summarize(
+        mean_cor = mean(cor, na.rm = TRUE),
+        median_cor = median(cor, na.rm = TRUE),
+        q25 = quantile(cor, 0.25, na.rm = TRUE),
+        q75 = quantile(cor, 0.75, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+optimal_lag <- lag_summary$lag[which.max(lag_summary$mean_cor)]
+
+if (n_inter_locations > 1) {
+    ggplot(lag_summary, aes(x = lag)) +
+        geom_ribbon(aes(ymin = q25, ymax = q75, fill = "IQR"), alpha = 0.2) +
+        geom_line(aes(y = mean_cor, color = "Mean"), size = 1.2) +
+        geom_point(aes(y = mean_cor, color = "Mean"), size = 2, fill = "transparent") +
+        geom_line(aes(y = median_cor, color = "Median"),
+            linetype = "dashed", size = 0.8
+        ) +
+        geom_vline(xintercept = optimal_lag, linetype = "dotted", color = "black") +
+        annotate("text",
+            x = optimal_lag, y = -1, label = sprintf("Optimal: %d", optimal_lag),
+            hjust = -0.1, vjust = -0.5, size = 4
+        ) +
+        scale_x_continuous(breaks = breaks_pretty()) +
+        scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
+        labs(
+            title = sprintf("Summary metrics vs. %s", lag_unit_label),
+            x = lag_unit_label, y = expression(paste("Spearman ", rho)),
+            color = "", fill = ""
+        )
+}
+```
+
+```{r}
+#| label: cor-choropleth-text
+#| echo: false
+#| results: asis
+if (n_inter_locations > 1 && params$geo_type %in% c("state", "county")) {
+    cor_optimal_test <- epi_cor(df_inter, candidate, guiding,
+        cor_by = geo_value, dt1 = -optimal_lag,
+        method = "spearman"
+    )
+    looks_like_state <- params$geo_type == "state" && all(nchar(cor_optimal_test$geo_value) == 2)
+    looks_like_county <- params$geo_type == "county" && all(nchar(cor_optimal_test$geo_value) == 5)
+
+    if (looks_like_state || looks_like_county) {
+        cat("### Choropleth Map at Optimal Lag\n\n")
+        cat(glue("This geographic map colors each {params$geo_type} according to its temporal Spearman correlation with the guiding indicator, specifically evaluated at the optimal lag we found in the previous section.\n\n"))
+    }
+}
+```
+
+```{r}
+#| label: cor-choropleth
+#| fig-height: 6
+
+cor_optimal <- epi_cor(df_inter, candidate, guiding,
+    cor_by = geo_value, dt1 = -optimal_lag,
+    method = "spearman"
+)
+
+if (n_inter_locations > 1 && params$geo_type %in% c("state", "county")) {
+    # Basic check to see if we have valid-looking state/county codes before trying geographic match
+    looks_like_state <- params$geo_type == "state" && all(nchar(cor_optimal$geo_value) == 2)
+    looks_like_county <- params$geo_type == "county" && all(nchar(cor_optimal$geo_value) == 5)
+
+    if (looks_like_state || looks_like_county) {
+        cor_choro <- cor_optimal %>%
+            rename(value = cor) %>%
+            mutate(
+                time_value = as.Date(params$start_day),
+                issue = as.Date(params$start_day),
+                data_source = "evaluation",
+                signal = "correlation"
+            )
+
+        attributes(cor_choro)$metadata$geo_type <- params$geo_type
+        class(cor_choro) <- c("covidcast_signal", "data.frame")
+
+        # Plot object evaluating as the last statement in the conditional
+        print(plot(cor_choro,
+            range = c(-1, 1), choro_col = c(dis_pal_list[3], "white", dis_pal_list[2]),
+            title = sprintf("Per-location correlation at optimal lag (%d %s)", optimal_lag, time_unit)
+        )) # For some reason this plot is only showing up when using print()
+
+        # Summary table of correlations at optimal lag
+        cor_top <- cor_optimal %>%
+            mutate(geo_name = geo_to_name(geo_value)) %>%
+            arrange(desc(cor)) %>%
+            select(geo_value, geo_name, cor)
+
+        DT::datatable(cor_top,
+            colnames = c("Geo-level", "Name", "Spearman Correlation"),
+            caption = sprintf("Strongest local correlations at %d %s lag", optimal_lag, time_unit),
+            rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, pageLength = params$max_locations_table, dom = "tp")
+        ) %>% DT::formatRound(columns = 3, digits = 3)
+    }
+}
+```
+
+---
+
+## Summary {#summary}
+
+```{r}
+#| label: summary-table
+findings <- tibble(
+    Metric = c(
+        "Mean geographic rank correlation (ρ)",
+        sprintf("Optimal lead time (%s)", time_unit),
+        "Mean ρ at optimal lag",
+        "Median per-location ρ (lag 0)",
+        "Median per-location ρ (optimal lag)",
+        "Locations with |ρ| > 0.5 (optimal lag)"
+    ),
+    Value = c(
+        sprintf("%.3f", mean_rho),
+        as.character(optimal_lag),
+        sprintf("%.3f", max(lag_summary$mean_cor)),
+        sprintf("%.3f", med_rho),
+        sprintf("%.3f", median(cor_optimal$cor, na.rm = TRUE)),
+        sprintf(
+            "%d / %d (%.0f%%)",
+            sum(abs(cor_optimal$cor) > 0.5, na.rm = TRUE),
+            nrow(cor_optimal),
+            100 * mean(abs(cor_optimal$cor) > 0.5, na.rm = TRUE)
+        )
+    )
+)
+
+DT::datatable(findings, caption = "Key evaluation metrics", rownames = FALSE, options = list(scrollX = TRUE, paging = FALSE, dom = "t"))
+```
+
