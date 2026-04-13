@@ -31,3 +31,8 @@ _site
 
 /_*.local
 **/*.quarto_ipynb
+*.html
+indicator_analysis/indicator_evaluation_cache/
+indicator_analysis/indicator_evaluation_files/
+indicator_analysis/data/
+indicator_analysis/epidatr_cache/
