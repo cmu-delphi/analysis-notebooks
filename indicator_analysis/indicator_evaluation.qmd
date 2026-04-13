@@ -73,9 +73,9 @@ if (!exists("params")) {
 # Load libraries
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
-    epidatr, epiprocess, covidcast,
+    epidatr, epiprocess,
     tidyverse, scales, patchwork,
-    knitr, here, MMWRweek, glue, DT, withr
+    here, glue
 )
 
 # Invalidate knitr cache when params change
@@ -197,7 +197,7 @@ format_excluded <- function(locs, names) {
 }
 
 # Set cache
-cache_path <- here::here("signal_analysis", "epidatr_cache")
+cache_path <- file.path(getwd(), "epidatr_cache")
 if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
 
 set_cache(cache_dir = cache_path)
