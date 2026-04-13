@@ -138,6 +138,9 @@ tibble::tribble(
         updater(name, setNames(list(dis_pal_list[1], alpha), c(aes, "alpha")))
     })
 
+# Helper: round any date to the immediately preceding Sunday (or same day if already Sunday)
+round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
+
 # Helper: build epirange with correct format for the indicator's time_type
 time_range <- function(start, end, time_type = params$time_type) {
     if (time_type == "week") {
@@ -155,11 +158,11 @@ time_range <- function(start, end, time_type = params$time_type) {
 # Helper: map geo codes to readable names
 geo_to_name <- function(geos, geo_type = params$geo_type) {
     if (geo_type == "state") {
-        names <- covidcast::abbr_to_name(geos)
+        names <- covidcast::abbr_to_name(toupper(geos))
     } else if (geo_type == "county") {
-        names <- covidcast::county_fips_to_name(geos)
+        names <- covidcast::county_fips_to_name(as.character(geos))
     } else if (geo_type == "msa") {
-        names <- covidcast::cbsa_to_name(geos)
+        names <- covidcast::cbsa_to_name(as.character(geos))
     } else {
         return(geos)
     }
@@ -305,9 +308,17 @@ cat(sprintf(
 if (is.null(candidate_archive) && is.null(params$candidate_csv)) {
     all_geos <- unique(df_candidate$geo_value)
     archive_geos <- random_sample(all_geos, params$max_archive_locs)
+    # Adjust lookback window
+    lookback <- switch(params$time_type,
+        "day" = lubridate::weeks(31),
+        "week" = lubridate::weeks(150),
+        "month" = lubridate::months(36),
+        lubridate::weeks(31)
+    )
+
     archive_start <- as.character(max(
         as.Date(params$start_day),
-        as.Date(params$end_day) - lubridate::weeks(31)
+        as.Date(params$end_day) - lookback
     ))
 
     archive_info <- list(
@@ -352,8 +363,6 @@ if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type)
 
 # When time_type is weekly, align all dates to Sundays and aggregate
 if (env_time_type == "week") {
-    round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
-
     df_guiding <- df_guiding %>%
         mutate(time_value = round_to_sunday(time_value)) %>%
         group_by(geo_value, time_value) %>%
@@ -604,8 +613,9 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
 #| echo: false
 #| results: asis
 #| eval: !expr n_inter_locations > 1
-cat("#### Aberrant Locations\n\n")
-cat("While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the daily 95th percentile) for each indicator.\n\n")
+cat("#### Cross-Sectional Geographic Outliers\n\n")
+cat("While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the cross-sectional 95th percentile recorded on that specific date) for each indicator.\n\n")
+cat("> **Note**: This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than epidemiological aberration.\n\n")
 ```
 
 ```{r}
@@ -1701,7 +1711,17 @@ versions <- sort(unique(candidate_archive$DT$version))
 
 cor_lagged_realtime <- map_dfr(versions, function(vv) {
     snap <- epix_as_of(candidate_archive, vv)
-    latest_tv <- max(snap$time_value, na.rm = TRUE)
+    if (env_time_type == "week") {
+        snap <- snap %>%
+            mutate(time_value = round_to_sunday(time_value)) %>%
+            group_by(geo_value, time_value) %>%
+            summarize(value = mean(value, na.rm = TRUE), .groups = "drop")
+    }
+    valid_tvs <- snap$time_value[snap$time_value %in% df_guiding$time_value]
+    if (length(valid_tvs) == 0) {
+        return(tibble(version = vv, lag = lag_values, cor = NA_real_))
+    }
+    latest_tv <- max(valid_tvs, na.rm = TRUE)
     map_dfr(lag_values, function(lg) {
         target_tv <- switch(env_time_type,
             week  = latest_tv - lubridate::weeks(lg),

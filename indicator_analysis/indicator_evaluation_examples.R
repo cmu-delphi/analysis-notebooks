@@ -9,8 +9,8 @@ qmd_path <- here::here("indicator_analysis/indicator_evaluation.qmd")
 # Helper to generate descriptive output names
 get_output_name <- function(params, suffix = "") {
   # Get signals (fallback to defaults if missing)
-  g_sig <- params$guiding_source %||% "hhs"
-  c_sig <- params$candidate_source %||% "doctor-visits"
+  g_sig <- params$guiding_source
+  c_sig <- params$candidate_source
 
   # Sanitize (dash to underscore, remove special chars)
   name <- sprintf("eval_%s_vs_%s%s.html", g_sig, c_sig, suffix)
@@ -18,7 +18,7 @@ get_output_name <- function(params, suffix = "") {
 }
 
 # Default API (State level)
-eval_params_1 <- list(
+params_api_state <- list(
   guiding_source = "hhs",
   guiding_indicator = "confirmed_admissions_covid_1d",
   guiding_name = "COVID Hospital Admissions (HHS)",
@@ -32,8 +32,8 @@ eval_params_1 <- list(
 )
 quarto::quarto_render(
   input = qmd_path,
-  output_file = get_output_name(eval_params_1, "_api_state"),
-  execute_params = eval_params_1
+  output_file = get_output_name(params_api_state, "_api_state"),
+  execute_params = params_api_state
 )
 pophive_params <- list(
   guiding_source = "nhsn",
@@ -137,13 +137,11 @@ df_candidate <- df_candidate_raw %>%
 
 write_csv(df_candidate, fs::path(data_dir, "candidate.csv"))
 
-output_file_3 <- "signal_evaluation_example_3_csv_nssp_wastewater.html"
-
 # Define absolute paths based on the new data
 guiding_csv_path <- fs::path_abs(fs::path(data_dir, "guiding.csv"))
 candidate_csv_path <- fs::path_abs(fs::path(data_dir, "candidate.csv"))
 
-eval_params_3 <- list(
+params_csv_nssp_wastewater <- list(
   guiding_source = "NSSP",
   guiding_indicator = "percent_visits_covid",
   guiding_name = "NSSP ED Visits: COVID-19",
@@ -161,33 +159,12 @@ eval_params_3 <- list(
 # Execute quarto
 quarto::quarto_render(
   input = qmd_path,
-  output_file = get_output_name(eval_params_3, "_csv_nssp_wastewater"),
-  execute_params = eval_params_3
-)
-
-# PopHive (beta_pophive) weekly data at State level
-eval_params_pophive <- list(
-  guiding_source = "NSSP",
-  guiding_indicator = "percent_visits_covid",
-  guiding_name = "NSSP ED Visits: COVID (Weekly)",
-  guiding_csv = as.character(guiding_csv_path),
-  candidate_source = "beta_pophive",
-  candidate_indicator = "epic_n_covid_total",
-  candidate_name = "PopHive: COVID Total",
-  time_type = "week",
-  geo_type = "state",
-  start_day = "2023-01-01",
-  end_day = as.character(max(df_guiding$time_value))
-)
-
-quarto::quarto_render(
-  input = qmd_path,
-  output_file = get_output_name(eval_params_pophive, "_pophive_weekly"),
-  execute_params = eval_params_pophive
+  output_file = get_output_name(params_csv_nssp_wastewater, "_csv_nssp_wastewater"),
+  execute_params = params_csv_nssp_wastewater
 )
 
 # Default API (County level)
-eval_params_2 <- list(
+params_api_county <- list(
   guiding_source = "jhu-csse",
   guiding_indicator = "confirmed_incidence_num",
   guiding_name = "JHU COVID-19 Cases",
@@ -201,6 +178,6 @@ eval_params_2 <- list(
 )
 quarto::quarto_render(
   input = qmd_path,
-  output_file = get_output_name(eval_params_2, "_api_county"),
-  execute_params = eval_params_2
+  output_file = get_output_name(params_api_county, "_api_county"),
+  execute_params = params_api_county
 )
