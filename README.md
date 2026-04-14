@@ -1,0 +1,34 @@
+# Delphi Analysis Notebooks
+
+This repository contains parameterizable notebooks for analyzing and tracking epidemiological indicators in the Delphi data pipeline. 
+
+## Existing Notebooks
+
+*   [`indicator_analysis/indicator_evaluation.qmd`](indicator_analysis/indicator_evaluation.qmd). A notebook designed to evaluate a candidate indicator against a guiding indicator.
+*   [`revision_analysis/revision_analysis.qmd`](revision_analysis/revision_analysis.qmd). A notebook for tracking indicator revisions over time to analyze their stabilization properties. It tracks how quickly initial daily/weekly estimates converge to their final values over time.
+
+## Generating and Publishing Examples
+
+The notebooks act as parameterized templates. To generate local examples and publish them as a website to GitHub Pages, the repository relies on Quarto's publishing mechanism and a pre-render hook.
+
+Some relevant files are:
+
+*   [`_quarto.yml`](_quarto.yml). Contains the rules for the website structure, navigation menu, and specifies the pre-render script.
+*   [`scripts/pre_render.R`](scripts/pre_render.R). Automatically executes the `.qmd` notebooks with pre-defined parameters to generate static HTML examples before the website is built.
+*   [`index.qmd`](index.qmd). The main page of the website. It is used to make the rendered html files visible in the website.
+
+### Including a New Example
+
+To add a new analysis example to the website:
+
+1.  Add a new block of code in `scripts/pre_render.R` that calls `quarto::quarto_render()` with your desired `execute_params`. 
+2. To make the rendered html visible on the website, update `_quarto.yml` and/or `index.qmd` to include a link to your newly generated HTML file.
+3.  Preview or Publish:
+    *   To view the changes locally, run:
+        ```bash
+        quarto preview
+        ```
+    *   To publish the updated examples directly to the `gh-pages` branch, run:
+        ```bash
+        quarto publish gh-pages
+        ```
