@@ -1,0 +1,1137 @@
+---
+title: "Revision Analysis: `r params$signal_name`"
+author: "Delphi Group"
+date: today
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    max-width: 1280px
+params:
+  # Signal to analyze
+  source: 
+  signal: 
+  signal_name: 
+  # Optional path to a local CSV or Parquet directory with a version/issue column.
+  # When NULL, the signal is fetched from the Delphi API with issues = "*".
+  input: NULL
+  # Shared settings
+  geo_type:  
+  time_type: 
+  start_day: 
+  end_day:   
+  # Maximum locations shown in faceted plots / summary tables.
+  max_locations_plot: 6
+  max_locations_table: 15
+  # "Quick revision" threshold in days (used in revision_analysis() print).
+  quick_revision: 7
+  # Number of worst-behaving locations to highlight.
+  n_worst: 18
+  # Convergence threshold: how close (relative) a version must be to the
+  # latest known value to be considered "converged".
+  convergence_threshold: 0.05
+knitr:
+  opts_chunk:
+    comment: "#>"
+    message: FALSE
+    warning: FALSE
+    out.width: "100%"
+    dev: "png"
+    fig.width: 9
+    fig.height: 5
+    fig.align: center
+editor_options:
+  chunk_output_type: console
+execute:
+  cache: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| cache: false
+
+# When running interactively, fall back to the parameter defaults.
+if (!exists("params")) {
+    params <- list(
+        source                = "hospital-admissions",
+        signal                = "smoothed_covid19_from_claims",
+        signal_name           = "Hospital Admissions: Smoothed COVID-19 from Claims",
+        input                 = "notebooks/revision_analysis/data/df_raw.csv",
+        geo_type              = "state",
+        time_type             = "day",
+        start_day             = "2023-01-01",
+        end_day               = "2023-02-01",
+        max_locations_plot    = 6,
+        max_locations_table   = 15,
+        quick_revision        = 7,
+        n_worst               = 18,
+        convergence_threshold = 0.05
+    )
+}
+
+# Load libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+    epidatr, epiprocess, covidcast,
+    tidyverse, scales, patchwork,
+    knitr, here, MMWRweek, glue, DT,
+    fs, arrow
+)
+
+# Invalidate knitr cache when params change
+knitr::opts_chunk$set(cache.extra = list(params))
+
+# Set theme and colors
+colours <- c(
+    "#172431",
+    "#ffffff",
+    "#C41230",
+    "#941120",
+    "#007BC0",
+    "#002676",
+    "#FDB515",
+    "#002145",
+    "#00A7E1",
+    "#8C338F",
+    "#368f33"
+)
+
+# Palette selection
+dis_pal <- colours[c(3, 5, 7, 10, 11, 9)]
+
+theme_set(
+    theme_minimal(base_family = "Lato", base_size = 12) +
+        theme(
+            plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+            plot.caption = element_text(hjust = 0, color = "gray50"),
+            panel.grid = element_line(linetype = 2, linewidth = 0.3, color = "gray90"),
+            panel.grid.minor = element_blank(),
+            legend.position = "top",
+            strip.background = element_rect(fill = "gray95", linetype = "blank"),
+            panel.border = element_rect(color = "gray95", fill = NA)
+        )
+)
+
+# Palette as global defaults for discrete and continuous scales
+options(
+    ggplot2.discrete.colour   = dis_pal,
+    ggplot2.discrete.fill     = dis_pal,
+    ggplot2.continuous.colour = function() scale_colour_gradientn(colours = dis_pal),
+    ggplot2.continuous.fill   = function() scale_fill_gradientn(colours = dis_pal)
+)
+
+# Update defaults for geoms/stats
+tibble::tribble(
+    ~name,      ~aes,     ~alpha, ~is_stat,
+    "line",     "colour", 1.0,    FALSE,
+    "point",    "colour", 0.7,    FALSE,
+    "function", "colour", 1.0,    FALSE,
+    "bar",      "fill",   0.9,    FALSE,
+    "col",      "fill",   0.9,    FALSE,
+    "boxplot",  "fill",   0.8,    FALSE,
+    "bin",      "fill",   0.8,    TRUE,
+    "identity", "fill",   0.7,    TRUE
+) %>%
+    purrr::pwalk(function(name, aes, alpha, is_stat) {
+        updater <- if (is_stat) update_stat_defaults else update_geom_defaults
+        params <- list(dis_pal[1], alpha)
+        names(params) <- c(aes, "alpha")
+        if (name == "boxplot") params$outlier.shape <- NA
+        updater(name, params)
+    })
+
+# Helper: build epirange with correct format for the signal's time_type
+time_range <- function(start, end, time_type = params$time_type) {
+    if (time_type == "week") {
+        to_yw <- function(d) {
+            d <- as.Date(d)
+            m <- MMWRweek::MMWRweek(d)
+            m$MMWRyear * 100L + m$MMWRweek
+        }
+        epirange(to_yw(start), to_yw(end))
+    } else {
+        epirange(start, end)
+    }
+}
+
+# Set cache
+cache_path <- file.path(getwd(), "epidatr_cache")
+if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
+
+set_cache(cache_dir = cache_path, days = Inf)
+
+# Helper: format a difftime object as a plain number of days
+as_days <- function(x) as.numeric(x, units = "days")
+```
+
+This notebook analyses the **revision behaviour** of a single time series stored
+as an `epi_archive`. The central question is:
+
+> How long, on average, does a series continue to receive revisions after
+> its first publication?
+
+```{r}
+#| label: print-config
+#| echo: false
+
+config_tbl <- tibble(
+    Field = c("Source", "Signal", "Label", "Geography", "Period"),
+    Value = c(
+        params$source, params$signal, params$signal_name,
+        params$geo_type,
+        paste(params$start_day, "to", params$end_day)
+    )
+)
+
+DT::datatable(
+    config_tbl,
+    caption = "Analysis configuration",
+    rownames = FALSE,
+    options = list(scrollX = TRUE, dom = "t", paging = FALSE)
+)
+```
+
+---
+
+## Data Loading {#data}
+
+```{r}
+#| label: load-archive
+#| results: asis
+#| message: true
+
+archive <- NULL
+
+if (!is.null(params$input)) {
+    path <- here::here(params$input)
+
+    if (fs::is_dir(path)) {
+        cli::cli_inform("Reading data from directory: {.path {params$input}}")
+        raw <- arrow::open_dataset(path) %>%
+            select(any_of(c("geo_value", "time_value", "version", "issue", "value"))) %>%
+            filter(
+                time_value >= as.Date(params$start_day),
+                time_value <= as.Date(params$end_day)
+            ) %>%
+            collect()
+    } else if (grepl("\\.parquet$", path)) {
+        cli::cli_inform("Reading Parquet file: {.path {params$input}}")
+        raw <- arrow::read_parquet(path)
+    } else {
+        cli::cli_inform("Reading CSV file: {.path {params$input}}")
+        raw <- read_csv(path)
+    }
+
+    raw <- raw %>% mutate(time_value = as.Date(time_value))
+
+    # Accept either 'version' or 'issue' as the version column.
+    if ("issue" %in% names(raw) && !"version" %in% names(raw)) {
+        raw <- rename(raw, version = issue)
+    }
+
+    if (!"version" %in% names(raw)) {
+        cli::cli_abort(
+            "The input data must contain a 'version' or 'issue' column. ",
+            "See the README for the required schema."
+        )
+    }
+
+    # If it was a single file (CSV/Parquet), we still need to filter/mutate metadata
+    if (!fs::is_dir(path)) {
+        raw <- raw %>%
+            mutate(version = as.Date(version)) %>%
+            filter(
+                time_value >= as.Date(params$start_day),
+                time_value <= as.Date(params$end_day)
+            )
+    }
+
+    archive <- raw %>%
+        select(geo_value, time_value, version, value) %>%
+        as_epi_archive()
+
+    msg_verb <- "Loaded"
+} else {
+    df_raw <- pub_covidcast(
+        source = params$source,
+        signal = params$signal,
+        geo_type = params$geo_type,
+        time_type = params$time_type,
+        time_values = epirange(params$start_day, params$end_day),
+        issues = "*"
+    )
+    # write_csv(df_raw, here::here(params$input))
+
+    if (nrow(df_raw) == 0 || !"issue" %in% colnames(df_raw)) {
+        cli::cli_abort(
+            "No versioned data returned from the API. ",
+            "The signal may not support revision history."
+        )
+    }
+
+    archive <- df_raw %>%
+        rename(version = issue) %>%
+        select(geo_value, time_value, version, value) %>%
+        as_epi_archive()
+
+    msg_verb <- "Fetched"
+}
+
+# Metadata calculation
+n_rows <- nrow(archive$DT)
+n_locations <- n_distinct(archive$DT$geo_value)
+n_versions <- n_distinct(archive$DT$version)
+version_start <- min(archive$DT$version)
+version_end <- max(archive$DT$version)
+
+# Data loading summary message
+cli::cli_inform(c("i" = "{msg_verb} {label_comma()(n_rows)} rows | {label_comma()(n_locations)} locations | {label_comma()(n_versions)} versions ({version_start} – {version_end})"))
+
+# Reclaim memory
+invisible(gc())
+```
+
+```{r}
+#| label: quarto-metadata
+#| results: asis
+#| echo: false
+
+# Dynamically set Quarto metadata so we can use it in ::: {.content-visible}
+# blocks later.
+n_years <- n_distinct(year(archive$DT$time_value))
+cat(sprintf(
+    "\n---\nmulti_location: %s\nmulti_year: %s\n---\n",
+    tolower(n_locations > 1),
+    tolower(n_years > 1)
+))
+```
+
+```{r}
+#| label: archive-meta
+#| include: false
+
+archive_span <- as.numeric(version_end - version_start, units = "days")
+has_history <- archive_span >= 60
+all_geos <- sort(unique(archive$DT$geo_value))
+```
+
+```{r}
+#| label: archive-guard-message
+#| echo: false
+#| results: asis
+
+if (!has_history) {
+    cat(sprintf(
+        "> **Warning**: only %d days of version history are available ",
+        archive_span
+    ))
+    cat(sprintf(
+        "(%s – %s). At least 60 days are needed for a meaningful ",
+        version_start, version_end
+    ))
+    cat(sprintf(
+        "revision analysis. The earliest this will be possible is %s.\n\n",
+        version_start + 60
+    ))
+}
+```
+
+---
+
+## Overall revision summary {#overall}
+
+[`revision_analysis()`](https://delphi.cmu.edu/epiprocess/reference/revision_analysis.html) provides a concise summary of how a signal matures. The results describe the **spread of revisions**, which measures the difference between the minimum and maximum values ever published for an observation. Scaling this by the signal's value gives the **relative spread**. This shows the magnitude of revisions as a percentage. The report also presents **convergence** through the time it takes for data to reach within 20% of its final value. This convergence metric identifies the median duration before an observation enters and stays in its final neighborhood.
+
+```{r}
+#| label: revision-analysis
+
+rev_result <- epiprocess::revision_analysis(
+    archive,
+    value,
+    min_waiting_period = NULL
+)
+rev_beh <- rev_result$revision_behavior
+
+# Global metrics for follow-on plots/narrative
+max_lag_days <- as_days(rev_beh$max_lag)
+no_rev_pct <- mean(rev_beh$n_revisions == 0, na.rm = TRUE)
+conv_days_all <- as_days(rev_beh$lag_near_latest)
+invisible(gc())
+```
+
+```{r}
+#| label: convergence-compute
+
+# Pre-calculate relative differences to final for all observations.
+# We also find the first release version for age calculation.
+convergence_df <- archive$DT %>%
+    group_by(geo_value, time_value) %>%
+    mutate(
+        version_first = min(version, na.rm = TRUE),
+        value_latest = value[which.max(version)]
+    ) %>%
+    ungroup() %>%
+    filter(value_latest != 0, !is.na(value_latest), !is.na(value)) %>%
+    mutate(
+        days_since_first = as.numeric(version - version_first, units = "days"),
+        abs_rel_diff = abs(value - value_latest) / abs(value_latest)
+    )
+invisible(gc())
+```
+
+```{r}
+#| label: revision-analysis-print
+#| message: true
+
+rev_result %>%
+    print(quick_revision = params$quick_revision)
+```
+
+
+::: {.content-visible when-meta="multi_location"}
+
+Here we collect a number of statistics for each location. This includes:
+
+- Avg # revisions. The average number of times a value was updated after first release across all dates for that location.
+- Min lag. The minimum number of days between the event date and the first publication.
+- Max lag. The maximum number of days between the event date and the final revision.
+- Avg spread. The average absolute difference between the minimum and maximum published values.
+- Avg rel. spread. The average relative difference between the minimum and maximum published values.
+- Med. rel. spread. The median relative spread across all observation dates.
+- Med. window (d). The median number of days from first publication to the final revision.
+- Avg conv. (d). The average days until the value stays within a certain percentage (default 20%) of the final value and never leaves it.
+
+```{r}
+#| label: location-stats-compute
+#| include: false
+
+location_stats <- rev_beh %>%
+    group_by(geo_value) %>%
+    summarize(
+        n_rev = mean(n_revisions),
+        min_lag = min(min_lag),
+        max_lag = max(max_lag),
+        spread = mean(spread),
+        rel_spread = mean(rel_spread),
+        median_rel_spread = median(rel_spread, na.rm = TRUE),
+        median_window = median(as_days(max_lag), na.rm = TRUE),
+        lag_near_latest = mean(lag_near_latest),
+        .groups = "drop"
+    )
+
+# Find highest/lowest for the commentary
+sorted_conv <- location_stats %>% arrange(desc(lag_near_latest))
+highest_loc <- sorted_conv$geo_value[1]
+lowest_loc <- sorted_conv$geo_value[nrow(sorted_conv)]
+```
+
+```{r}
+#| label: location-stats-table
+#| echo: false
+#| eval: !expr n_locations > 1
+
+DT::datatable(
+    location_stats,
+    colnames = c(
+        "Location", "Avg # revisions", "Min lag", "Max lag",
+        "Avg spread", "Avg rel. spread", "Med. rel. spread",
+        "Med. window (d)", "Avg conv. (d)"
+    ),
+    caption = sprintf(
+        "Revision behavior statistics by location for %s.",
+        params$signal_name
+    ),
+    rownames = FALSE,
+    options = list(
+        scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+        paging = TRUE, pageLength = params$max_locations_table, dom = "tp"
+    )
+) %>%
+    DT::formatRound(columns = c(2, 5, 6, 7, 8, 9), digits = 3)
+```
+
+:::
+
+---
+
+## Reporting Latency {#pipeline}
+
+### Issue date cadence
+
+```{r}
+#| label: pipeline-issue-cadence
+#| fig-height: 3.5
+
+issue_dates <- sort(unique(archive$DT$version))
+gaps <- as.numeric(diff(issue_dates), units = "days")
+
+tibble(gap = gaps) %>%
+    ggplot(aes(x = gap)) +
+    geom_histogram(bins = 30, color = "white") +
+    scale_x_continuous(breaks = breaks_pretty()) +
+    labs(
+        title = "Cadence of archive updates",
+        subtitle = sprintf(
+            "%d unique issue dates | median gap: %.0f d",
+            n_versions, median(gaps)
+        ),
+        x = "Gap (days)", y = "Count"
+    )
+```
+
+### Reporting latency by geography
+
+Each coloured line is a different issue date. Darker shades are older. Vertical
+spread at a single `time_value` indicates back-revision.
+
+```{r}
+#| label: backfill-gap-compute
+
+backfill_df <- archive$DT %>%
+    filter(!is.na(value)) %>%
+    group_by(geo_value, time_value) %>%
+    mutate(
+        backfill_gap = as.numeric(version - time_value, units = "days"),
+        is_initial_release = version == min(version, na.rm = TRUE)
+    ) %>%
+    ungroup()
+```
+
+```{r}
+#| label: backfill-gap-geography
+#| fig-height: 8
+
+# Identify worst locations for deeper drill-down
+worst_geos <- location_stats %>%
+    arrange(desc(rel_spread)) %>%
+    slice_head(n = params$n_worst %||% 12) %>%
+    pull(geo_value)
+n_worst_actual <- length(worst_geos)
+
+backfill_geom <- backfill_df %>%
+    filter(geo_value %in% worst_geos) %>%
+    mutate(geo_value = factor(geo_value, levels = worst_geos))
+
+ggplot(backfill_geom, aes(x = backfill_gap, fill = is_initial_release)) +
+    geom_histogram(bins = 40, position = "identity", alpha = 0.7) +
+    facet_wrap(~geo_value, ncol = 3, scales = "free_y") +
+    scale_fill_manual(
+        values = c("TRUE" = dis_pal[2], "FALSE" = dis_pal[1]),
+        labels = c("TRUE" = "Initial Release", "FALSE" = "Subsequent Revision"),
+        name = "Release type"
+    ) +
+    scale_x_continuous(breaks = breaks_pretty()) +
+    labs(
+        title = "Backfill gap distribution (worst locations)",
+        subtitle = "Initial release latency (blue) vs. subsequent revision depth (red)",
+        x = "Backfill gap (days)",
+        y = "Count"
+    ) +
+    theme(legend.position = "top", strip.text.x = element_text(size = 8))
+```
+
+### Visualizing version history
+
+Each coloured line represents a different issue date. Vertical spread at a single `time_value` indicates the magnitude of the backfill corrections over time.
+
+```{r}
+#| label: pipeline-fan-plot
+
+min_v <- min(issue_dates)
+max_v <- max(issue_dates)
+
+# selected_versions <- data.frame(version = issue_dates) %>%
+#     mutate(age = as.numeric(version - min_v)) %>%
+#     filter(
+#         age <= 7 |
+#             (age <= 21 & age %% 2 == 0) |
+#             (age <= 365 & age %% 30 == 0) |
+#             (age %% 60 == 0) |
+#             version == max_v
+#     ) %>%
+#     pull(version)
+
+# archive %>%
+#     autoplot(value,
+#         .versions = selected_versions,
+#         .interactive = FALSE
+#     ) +
+#     scale_colour_viridis_c(
+#         option = "plasma",
+#         begin = 0, end = 0.8,
+#         labels = scales::label_date(),
+#         trans = "date"
+#     ) +
+#     theme(legend.position = "bottom")
+```
+
+---
+
+## Revision duration & maturation {#maturation}
+
+This section assesses how long it takes for a signal to stabilize. We consider both the time until the final revision and the time until the value stays persistently within a given percentage of its eventually finalized value.
+
+```{r}
+#| label: stability-compute
+
+# Define thresholds for assessment (relative differences)
+thresholds <- c(0.5, 0.2, 0.1, 0.05, 0.02)
+
+# Calculate stabilization lags for each threshold
+stability_multi <- map_dfr(thresholds, function(tau) {
+    convergence_df %>%
+        group_by(geo_value, time_value) %>%
+        arrange(desc(version)) %>%
+        summarize(
+            # Find the lag of the last version that was ABOVE the threshold.
+            # The next version is when it became "stable".
+            lag_stable = {
+                over <- which(abs_rel_diff > tau)
+                if (length(over) == 0) {
+                    0
+                } else {
+                    max(days_since_first[over])
+                }
+            },
+            threshold = label_percent()(tau),
+            threshold_num = tau,
+            .groups = "drop"
+        )
+})
+
+# Combine with the "final revision" window (max_lag from original behavior)
+rev_window_df <- rev_beh %>%
+    filter(n_revisions > 0) %>%
+    transmute(
+        geo_value, time_value,
+        lag_stable = as_days(max_lag),
+        threshold = "Final revision",
+        threshold_num = 0
+    )
+
+stability_combined <- bind_rows(stability_multi, rev_window_df) %>%
+    mutate(threshold = factor(threshold, levels = c("50%", "20%", "10%", "5%", "2%", "Final revision")))
+invisible(gc())
+```
+
+### Distribution of stabilization times
+
+How long does it typically take to reach each stability threshold?
+
+```{r}
+#| label: stability-histograms
+#| fig-height: 7
+
+ggplot(stability_combined, aes(x = lag_stable, fill = threshold)) +
+    geom_histogram(bins = 40, color = "white") +
+    facet_wrap(~threshold, ncol = 1, scales = "free_y") +
+    scale_x_continuous(breaks = breaks_pretty()) +
+    labs(
+        title = "Stabilization time distribution",
+        subtitle = "Days from first publication to persistent stability",
+        x = "Days since first release",
+        y = "Number of observations",
+        fill = "Threshold"
+    )
+```
+
+### Comparative ECDF of stabilization
+
+By day X, what fraction of observations have settled within the specified threshold and never leave it?
+
+```{r}
+#| label: revision-duration-ecdf-multi
+#| fig-height: 5
+
+ggplot(stability_combined, aes(x = lag_stable, color = threshold)) +
+    stat_ecdf(linewidth = 0.8) +
+    scale_x_continuous(breaks = breaks_pretty()) +
+    scale_y_continuous(labels = label_percent()) +
+    labs(
+        title = "ECDF of stabilization time by threshold",
+        subtitle = "Showing when observations reach and stay within X% of the final value",
+        x = "Days from first publication to stabilization",
+        y = "Cumulative fraction of observations",
+        color = "Threshold"
+    )
+```
+
+### Stabilization summary
+
+```{r}
+#| label: stability-summary-table
+#| echo: false
+
+stability_combined %>%
+    group_by(threshold) %>%
+    summarize(
+        median = median(lag_stable, na.rm = TRUE),
+        p75 = quantile(lag_stable, 0.75, na.rm = TRUE),
+        p90 = quantile(lag_stable, 0.90, na.rm = TRUE),
+        p95 = quantile(lag_stable, 0.95, na.rm = TRUE),
+        p99 = quantile(lag_stable, 0.99, na.rm = TRUE),
+        max = max(lag_stable, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    DT::datatable(
+        colnames = c("Stability Threshold", "Median days", "P75 days", "P90 days", "P95 days", "P99 days", "Max days"),
+        caption = "Time to reach persistent stability (days since first release)",
+        rownames = FALSE,
+        options = list(dom = "t", paging = FALSE)
+    ) %>%
+    DT::formatRound(columns = 2:7, digits = 1)
+```
+
+---
+
+## Bias {#bias}
+
+This section explores if revisions follow predictable trends based on timing, geography, or signal magnitude.
+
+### Censoring bias
+
+The plot below shows how the speed of data stabilization changes over time. By grouping observations into time buckets, we can identify trends in reporting maturity for each threshold. The dashed line represents the censoring boundary, which marks the maximum possible lag available given the current date. As recent observations approach this boundary, their stabilization times are naturally truncated. This suggests that these data points may still be subject to further revisions.
+
+```{r}
+#| label: diagnostic-censoring
+#| fig-height: 4.5
+
+max_v <- max(archive$DT$version)
+
+# Determine best aggregation unit based on date range
+date_range_days <- as.numeric(max(stability_combined$time_value) - min(stability_combined$time_value))
+agg_unit <- case_when(
+    date_range_days > 365 * 2 ~ "quarter",
+    date_range_days > 365 ~ "month",
+    date_range_days > 100 ~ "2-week",
+    date_range_days > 40 ~ "week",
+    date_range_days > 20 ~ "3-day",
+    TRUE ~ "day"
+)
+
+# Plot stabilization lag over time across all thresholds
+stability_combined %>%
+    mutate(time_bucket = floor_date(time_value, unit = agg_unit)) %>%
+    ggplot(aes(x = time_bucket, y = lag_stable, color = threshold)) +
+    stat_summary(
+        fun.data = median_hilow, fun.args = list(conf.int = 0.5),
+        geom = "pointrange", position = position_dodge(width = 0.5)
+    ) +
+    geom_function(
+        fun = function(x) as.numeric(max_v - as.Date(x, origin = "1970-01-01")),
+        linetype = "dashed", color = "gray50", linewidth = 0.5
+    ) +
+    annotate(
+        "text",
+        x = min(stability_combined$time_value),
+        y = as_days(max_v - min(stability_combined$time_value)),
+        label = "Censoring Boundary", color = "gray50",
+        vjust = -1, hjust = -0.1, size = 3
+    ) +
+    scale_x_date(breaks = breaks_pretty()) +
+    scale_y_continuous(breaks = breaks_pretty()) +
+    labs(
+        title = "Stabilization distribution over time",
+        subtitle = sprintf(
+            "Distribution of days to persistent stability grouped by %s
+            Dots indicate the median, while lines show the IQR.",
+            agg_unit
+        ),
+        x = "Observation date (aggregated)",
+        y = "Days since first publication",
+        color = "Threshold"
+    )
+```
+
+### Signal magnitude bias
+
+This section examines if the relative scale of revisions is influenced by the magnitude of the signal itself. This is visualized by comparing the maximum observed value against the relative spread (total revision range divided by the signal's final value) on a log-log scale. This analysis helps determine if the signal becomes more volatile at specific scales, for instance, if low-value periods are subject to proportionately larger revisions than high-value periods.
+
+```{r}
+#| label: diagnostic-magnitude
+#| fig-height: 4.5
+
+rev_beh %>%
+    filter(rel_spread > 0) %>%
+    ggplot(aes(x = max_value, y = rel_spread)) +
+    geom_point(alpha = 0.2, size = 1) +
+    geom_smooth() +
+    scale_x_log10(labels = label_comma()) +
+    scale_y_log10(labels = label_percent()) +
+    labs(
+        title = "Signal magnitude vs. relative spread",
+        subtitle = "Log-log scale",
+        x = "Maximum observed value (log scale)", y = "Relative spread (log scale)"
+    )
+```
+
+
+## By Location Bias
+
+### Initial Bias
+
+Here we characterise whether each
+location tends to under- or over-report in its first release.
+
+For each observation we compute:
+
+$$\text{initial bias} = \frac{v_\text{first} - v_\text{latest}}{v_\text{latest}}$$
+
+A negative value means the first release was below the latest (under-reporting);
+a positive value means it was above (over-reporting).
+
+```{r}
+#| label: bias-compute
+
+# For each (geo_value, time_value) we need the *first* and *latest* value.
+# revision_behavior already carries `spread` (max - min) and `rel_spread`.
+# We reconstruct initial vs. latest from the raw archive DT.
+first_vals <- archive$DT %>%
+    group_by(geo_value, time_value) %>%
+    slice_min(version, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(geo_value, time_value, value_first = value)
+
+latest_vals <- archive$DT %>%
+    group_by(geo_value, time_value) %>%
+    slice_max(version, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(geo_value, time_value, value_latest = value)
+
+bias_df <- first_vals %>%
+    inner_join(latest_vals, by = c("geo_value", "time_value")) %>%
+    # Standard ordering
+    select(geo_value, time_value, value_first, value_latest) %>%
+    filter(value_latest != 0, !is.na(value_latest), !is.na(value_first)) %>%
+    mutate(initial_bias = (value_first - value_latest) / abs(value_latest))
+
+bias_by_loc <- bias_df %>%
+    group_by(geo_value) %>%
+    summarize(
+        median_bias = median(initial_bias, na.rm = TRUE),
+        pct_under   = mean(initial_bias < 0, na.rm = TRUE),
+        pct_over    = mean(initial_bias > 0, na.rm = TRUE),
+        .groups     = "drop"
+    ) %>%
+    arrange(median_bias)
+```
+
+```{r}
+#| label: bias-overview-plot
+#| fig-height: 5
+
+bias_df %>%
+    left_join(bias_by_loc %>% select(geo_value, median_bias), by = "geo_value") %>%
+    mutate(
+        geo_value = factor(geo_value, levels = bias_by_loc$geo_value),
+        direction = case_when(
+            median_bias < 0 ~ "Under-reporting",
+            median_bias > 0 ~ "Over-reporting",
+            TRUE ~ "No bias"
+        )
+    ) %>%
+    ggplot(aes(x = geo_value, y = initial_bias, fill = direction)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_hline(yintercept = 0, linewidth = 0.4, color = "gray40") +
+    scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
+    coord_cartesian(ylim = c(-1.0, 2.0)) +
+    labs(
+        title = "Initial-release bias distribution by location",
+        subtitle = "Distribution of (first_value − latest_value) / latest_value",
+        x = NULL, y = "Relative bias", fill = NULL
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```
+
+The table below provides a detailed breakdown of these maturation patterns for each location. It includes the median relative bias along with the percentage of observations that were under-reported (initial release was lower than the final value) or over-reported (initial release was higher).
+
+```{r}
+#| label: bias-table
+#| echo: false
+
+DT::datatable(
+    bias_by_loc,
+    colnames = c(
+        "Location", "Median rel. bias",
+        "% Under-reporting", "% Over-reporting"
+    ),
+    caption = sprintf(
+        "Initial-release bias (first backfill gap) by location for %s. Negative median bias = systematic under-reporting.",
+        params$signal_name
+    ),
+    rownames = FALSE,
+    options = list(
+        scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+        paging = TRUE, pageLength = params$max_locations_table, dom = "tp"
+    )
+) %>%
+    DT::formatRound(columns = 2, digits = 3) %>%
+    DT::formatPercentage(columns = 3:4, digits = 1)
+```
+
+### Total revision
+
+While the previous section focused on the first release, this analysis pools every version published for an observation. This provides a comprehensive view of the total volatility and systematic bias across the entire maturation history for each location.
+
+```{r}
+#| label: total-bias-compute
+
+total_bias_df <- archive$DT %>%
+    inner_join(latest_vals, by = c("geo_value", "time_value")) %>%
+    filter(value_latest != 0, !is.na(value_latest)) %>%
+    mutate(rel_bias = (value - value_latest) / abs(value_latest))
+
+total_bias_by_loc <- total_bias_df %>%
+    group_by(geo_value) %>%
+    summarise(
+        median_bias = median(rel_bias, na.rm = TRUE),
+        sd_bias     = sd(rel_bias, na.rm = TRUE),
+        .groups     = "drop"
+    ) %>%
+    arrange(median_bias)
+```
+
+```{r}
+#| label: total-bias-plot
+#| fig-height: 5
+
+total_bias_df %>%
+    left_join(total_bias_by_loc %>% select(geo_value, median_bias), by = "geo_value") %>%
+    mutate(
+        geo_value = factor(geo_value, levels = total_bias_by_loc$geo_value),
+        direction = case_when(
+            median_bias < 0 ~ "Under-reporting",
+            median_bias > 0 ~ "Over-reporting",
+            TRUE ~ "No bias"
+        )
+    ) %>%
+    ggplot(aes(x = geo_value, y = rel_bias, fill = direction)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_hline(yintercept = 0, linewidth = 0.4, color = "gray40") +
+    scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
+    coord_cartesian(ylim = c(-.5, .5)) +
+    scale_fill_manual(
+        values = c(
+            "Under-reporting" = dis_pal[1],
+            "Over-reporting"  = dis_pal[2],
+            "No bias"         = "gray70"
+        )
+    ) +
+    labs(
+        title = "Total revision bias distribution by location",
+        subtitle = "Distribution of (all_versions − latest_value) / latest_value",
+        x = NULL, y = "Relative bias", fill = NULL
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```
+
+## Geographic variation in revision window {#by-location}
+
+While the overall signal may stabilize within a consistent timeframe, reporting maturity often varies by geography. The plot below highlights how long it takes for each location to reach various stages of stability (50%, 20%, 10%, and 5% of their final value).
+
+```{r}
+#| label: rev-beh-by-loc-compute
+
+# Re-sort locations by their median stabilization lag at the tightest threshold (5%)
+geo_sorting <- stability_combined %>%
+    filter(threshold == "5%") %>%
+    group_by(geo_value) %>%
+    summarize(med_lag = median(lag_stable, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(med_lag)) %>%
+    pull(geo_value)
+
+# Fallback to ensure no NAs if sorting fails to match
+if (length(geo_sorting) == 0) geo_sorting <- sort(unique(stability_combined$geo_value))
+
+rev_by_loc <- rev_beh %>%
+    filter(n_revisions > 0) %>%
+    group_by(geo_value) %>%
+    summarize(
+        n_obs = n(),
+        avg_revisions = mean(n_revisions, na.rm = TRUE),
+        median_window_days = median(as_days(max_lag), na.rm = TRUE),
+        p90_window_days = quantile(as_days(max_lag), 0.9, na.rm = TRUE),
+        avg_rel_spread = mean(rel_spread, na.rm = TRUE),
+        median_conv_days = median(as_days(lag_near_latest), na.rm = TRUE),
+        .groups = "drop"
+    )
+```
+
+```{r}
+#| label: rev-by-location-maturation
+#| fig-height: 5
+#| eval: !expr n_locations > 3
+
+# Plot maturation stages across all thresholds defined in Section 5.1
+stability_combined %>%
+    mutate(
+        geo_value = factor(geo_value, levels = geo_sorting)
+    ) %>%
+    ggplot(aes(x = geo_value, y = lag_stable, color = threshold)) +
+    stat_summary(
+        fun.data = median_hilow, fun.args = list(conf.int = 0.5),
+        geom = "pointrange", position = position_dodge(width = 0.7)
+    ) +
+    scale_y_continuous(breaks = breaks_pretty()) +
+    labs(
+        title = "Maturation stages by location",
+        subtitle = "Days from first publication to reach 50%, 20%, 10%, and 5% stability (Dots = Median, Lines = IQR)",
+        x = "Location", y = "Days since first publication",
+        color = "Threshold"
+    ) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+    )
+```
+
+---
+
+## Convergence trajectory {#convergence}
+
+Here, it is measured how closely revisions approach the final reported value over time, using the absolute relative difference to the latest known value.
+
+
+### Overall distance to final value
+
+To understand how quickly the data stabilizes, we measure its distance to the final reported value over time. For each observation, we identify its initial release and the version we currently consider the ground truth. We then calculate the absolute relative difference (`|value - latest_value| / |latest_value|`) across every version of that data point. By averaging these errors based on the number of days since the first release, we can see how the gap closes over time. A value of 0% indicates full convergence, while a 10% difference suggests that, on average, the data point is still moving toward its eventual value even several days after its initial publication.
+
+```{r}
+#| label: convergence-overall-plot
+#| fig-height: 6
+
+overall_conv <- convergence_df %>%
+    group_by(days_since_first) %>%
+    summarize(
+        median_rel_diff = median(abs_rel_diff, na.rm = TRUE),
+        n_obs = n(),
+        .groups = "drop"
+    ) %>%
+    # Cap days to a reasonable plotting limit if it gets too sparse at the tail
+    filter(n_obs > 5)
+
+p1 <- ggplot(overall_conv, aes(x = days_since_first, y = median_rel_diff)) +
+    geom_line(color = dis_pal[1], linewidth = 1) +
+    scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
+    labs(
+        title = "Distance to final value across all locations",
+        subtitle = "Median absolute relative error vs. days since first publication",
+        x = "Days since first publication",
+        y = "Median absolute rel. difference"
+    )
+
+p2 <- ggplot(overall_conv, aes(x = days_since_first, y = n_obs)) +
+    geom_col(fill = "gray70") +
+    scale_y_continuous(labels = label_comma(), breaks = breaks_pretty()) +
+    labs(
+        x = "Days since first release",
+        y = "Number of observations"
+    )
+
+p1 / p2 + plot_layout(heights = c(3, 1))
+```
+
+### Convergence by worst locations
+
+```{r}
+#| label: convergence-location-plot
+#| fig-height: 8
+
+# Identify worst locations by relative spread
+n_worst <- params$n_worst %||% 12
+worst_geos <- location_stats %>%
+    arrange(desc(rel_spread)) %>%
+    slice_head(n = n_worst) %>%
+    pull(geo_value)
+n_worst_actual <- length(worst_geos)
+
+worst_geom_conv <- convergence_df %>%
+    filter(geo_value %in% worst_geos) %>%
+    group_by(geo_value, days_since_first) %>%
+    summarize(
+        median_rel_diff = median(abs_rel_diff, na.rm = TRUE),
+        n_obs = n(),
+        .groups = "drop"
+    ) %>%
+    filter(n_obs > 1) %>% # Filter extremely sparse points
+    mutate(geo_value = factor(geo_value, levels = worst_geos))
+
+ggplot(worst_geom_conv, aes(x = days_since_first)) +
+    geom_col(
+        aes(y = n_obs / max(n_obs) * max(median_rel_diff, na.rm = TRUE)),
+        fill = "gray80", alpha = 0.5
+    ) +
+    geom_line(aes(y = median_rel_diff), color = dis_pal[1], linewidth = 0.8) +
+    facet_wrap(~geo_value, ncol = 3, scales = "free_y") +
+    scale_y_continuous(
+        labels = label_percent(),
+        breaks = breaks_pretty(),
+        name = "Median absolute rel. diff."
+    ) +
+    labs(
+        title = sprintf("Distance to final value in the worst %d locations", n_worst_actual),
+        subtitle = "Line: median relative error; Bars: observation count vs. days since first publication",
+        x = "Days since first publication"
+    ) +
+    theme(strip.text.x = element_text(size = 8))
+```
+
+---
+
+## Summary {#summary}
+
+```{r}
+#| label: final-summary-narrative
+#| echo: false
+#| results: asis
+
+# Statistical context for the narrative
+final_rev_data <- stability_combined %>% filter(threshold == "Final revision")
+med_window <- round(median(final_rev_data$lag_stable, na.rm = TRUE))
+p90_window <- round(quantile(final_rev_data$lag_stable, 0.9, na.rm = TRUE))
+
+p_no_rev <- label_percent()(no_rev_pct)
+pct_under <- label_percent()(mean(bias_by_loc$median_bias < 0))
+
+cat(sprintf(
+    "For **%s** (`%s / %s`), the version history covering %s to %s\nshows the following revision and backfill profile:\n\n",
+    params$signal_name, params$source, params$signal,
+    params$start_day, params$end_day
+))
+
+cat(sprintf("- **%s** of observations were never revised after their initial report.\n", p_no_rev))
+cat(sprintf(
+    "- The **median time to persistent stability is %d days**: half of all revised ",
+    med_window
+))
+cat(sprintf(
+    "observations reached their final value within %d days of their first publication.\n",
+    med_window
+))
+cat(sprintf(
+    "- The 90th percentile for maturity is **%d days** (~%d weeks).\n",
+    p90_window, ceiling(p90_window / 7)
+))
+cat(sprintf(
+    "- **%s of locations** exhibit systematic under-reporting in their initial release.\n",
+    pct_under
+))
+
+# Threshold maturation summary
+stab_summary_meds <- stability_combined %>%
+    group_by(threshold) %>%
+    summarize(median = round(median(lag_stable, na.rm = TRUE)), .groups = "drop")
+
+cat(sprintf("- **Median days to reach stability**: "))
+cat(paste0(
+    "**", stab_summary_meds$threshold, "**: ", stab_summary_meds$median, " days",
+    collapse = " | "
+))
+cat(".\n\n")
+
+
+```

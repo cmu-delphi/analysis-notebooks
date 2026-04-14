@@ -24,6 +24,10 @@ website:
             href: indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html
           - text: "State: HHS vs Dr. Visits"
             href: indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html
+      - text: Revisions
+        menu:
+          - text: "State: COVID-19 Hospital Admissions"
+            href: revision_analysis/revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html
       - icon: github
         href: https://github.com/cmu-delphi/analysis-notebooks
 

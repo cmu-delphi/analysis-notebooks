@@ -76,3 +76,27 @@ if (!file.exists(out_county_ci)) {
 } else {
   message("Skipping existing report: eval_confirmed_incidence_num_vs_doctor_visits_api_county.html")
 }
+
+# 4. Revision Analysis: Hospital Admissions State
+rev_qmd_path <- here::here("revision_analysis", "revision_analysis.qmd")
+out_rev_state <- here::here("revision_analysis", "revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html")
+
+if (!file.exists(out_rev_state)) {
+  message(sprintf("Generating missing report: %s", out_rev_state))
+  quarto::quarto_render(
+    input = rev_qmd_path,
+    output_file = "revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html",
+    execute_params = list(
+      source = "hospital-admissions",
+      signal = "smoothed_covid19_from_claims",
+      signal_name = "Hospital Admissions: Smoothed COVID-19 from Claims",
+      input = "revision_analysis/data/revisions",
+      geo_type = "state",
+      time_type = "day",
+      start_day = "2020-01-01",
+      end_day = "2023-12-31"
+    )
+  )
+} else {
+  message("Skipping existing report: revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html")
+}

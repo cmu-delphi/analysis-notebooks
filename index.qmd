@@ -9,3 +9,6 @@ This repository hosts a collection of notebooks and reports for epidemiological 
 - [HHS vs. Doctor Visits (State)](indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html)
 - [JHU COVID-19 Cases vs Dr. Visits (County)](indicator_analysis/eval_jhu_csse_vs_doctor_visits_api_county.html)
 - [Confirmed Incidence vs. Doctor Visits (County)](indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html)
+
+## Revision Analysis
+- [State: Hospital Admissions (Smoothed COVID-19 from Claims)](revision_analysis/revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html)
