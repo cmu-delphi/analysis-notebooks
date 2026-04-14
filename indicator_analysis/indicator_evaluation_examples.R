@@ -8,12 +8,12 @@ qmd_path <- here::here("indicator_analysis/indicator_evaluation.qmd")
 
 # Helper to generate descriptive output names
 get_output_name <- function(params, suffix = "") {
-  # Get signals (fallback to defaults if missing)
-  g_sig <- params$guiding_source
-  c_sig <- params$candidate_source
-
-  # Sanitize (dash to underscore, remove special chars)
-  name <- sprintf("eval_%s_vs_%s%s.html", g_sig, c_sig, suffix)
+  name <- sprintf(
+    "eval_%s_vs_%s%s.html",
+    params$guiding_source,
+    params$candidate_source,
+    suffix
+  )
   stringr::str_replace_all(name, "[:space:]|[-]", "_")
 }
 
