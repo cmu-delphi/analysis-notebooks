@@ -60,7 +60,7 @@ if (!exists("params")) {
         source                = "hospital-admissions",
         signal                = "smoothed_covid19_from_claims",
         signal_name           = "Hospital Admissions: Smoothed COVID-19 from Claims",
-        input                 = "notebooks/revision_analysis/data/df_raw.csv",
+        input                 = "revision_analysis/data/revisions/",
         geo_type              = "state",
         time_type             = "day",
         start_day             = "2023-01-01",
@@ -717,10 +717,13 @@ agg_unit <- case_when(
 # Plot stabilization lag over time across all thresholds
 stability_combined %>%
     mutate(time_bucket = floor_date(time_value, unit = agg_unit)) %>%
-    ggplot(aes(x = time_bucket, y = lag_stable, color = threshold)) +
+    ggplot(aes(x = time_bucket, y = lag_stable, color = threshold, fill = threshold)) +
     stat_summary(
         fun.data = median_hilow, fun.args = list(conf.int = 0.5),
-        geom = "pointrange", position = position_dodge(width = 0.5)
+        geom = "ribbon", alpha = 0.2, color = NA
+    ) +
+    stat_summary(
+        fun = median, geom = "line"
     ) +
     geom_function(
         fun = function(x) as.numeric(max_v - as.Date(x, origin = "1970-01-01")),
@@ -731,7 +734,7 @@ stability_combined %>%
         x = min(stability_combined$time_value),
         y = as_days(max_v - min(stability_combined$time_value)),
         label = "Censoring Boundary", color = "gray50",
-        vjust = -1, hjust = -0.1, size = 3
+        vjust = 1, hjust = -1, size = 3
     ) +
     scale_x_date(breaks = breaks_pretty()) +
     scale_y_continuous(breaks = breaks_pretty()) +
@@ -739,12 +742,13 @@ stability_combined %>%
         title = "Stabilization distribution over time",
         subtitle = sprintf(
             "Distribution of days to persistent stability grouped by %s
-            Dots indicate the median, while lines show the IQR.",
+            Lines indicate the median, while ribbons show the IQR.",
             agg_unit
         ),
         x = "Observation date (aggregated)",
         y = "Days since first publication",
-        color = "Threshold"
+        color = "Threshold",
+        fill = "Threshold"
     )
 ```
 
@@ -839,7 +843,10 @@ bias_df %>%
     geom_boxplot(outlier.shape = NA, alpha = 0.7) +
     geom_hline(yintercept = 0, linewidth = 0.4, color = "gray40") +
     scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
-    coord_cartesian(ylim = c(-1.0, 2.0)) +
+    coord_cartesian(ylim = c(
+        min(0, quantile(bias_df$initial_bias, 0.025, na.rm = TRUE)),
+        max(0, quantile(bias_df$initial_bias, 0.975, na.rm = TRUE))
+    )) +
     labs(
         title = "Initial-release bias distribution by location",
         subtitle = "Distribution of (first_value − latest_value) / latest_value",
@@ -914,7 +921,10 @@ total_bias_df %>%
     geom_boxplot(outlier.shape = NA, alpha = 0.7) +
     geom_hline(yintercept = 0, linewidth = 0.4, color = "gray40") +
     scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
-    coord_cartesian(ylim = c(-.5, .5)) +
+    coord_cartesian(ylim = c(
+        min(0, quantile(total_bias_df$rel_bias, 0.025, na.rm = TRUE)),
+        max(0, quantile(total_bias_df$rel_bias, 0.975, na.rm = TRUE))
+    )) +
     scale_fill_manual(
         values = c(
             "Under-reporting" = dis_pal[1],
