@@ -12,5 +12,12 @@
     "title": "Delphi Analysis Notebooks",
     "section": "Indicator Evaluation",
     "text": "Indicator Evaluation\n\nHHS vs. Doctor Visits (State)\nJHU COVID-19 Cases vs Dr. Visits (County)\nConfirmed Incidence vs. Doctor Visits (County)"
+  },
+  {
+    "objectID": "index.html#revision-analysis",
+    "href": "index.html#revision-analysis",
+    "title": "Delphi Analysis Notebooks",
+    "section": "Revision Analysis",
+    "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
   }
 ]
