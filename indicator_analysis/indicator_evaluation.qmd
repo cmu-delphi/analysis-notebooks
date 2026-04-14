@@ -451,6 +451,19 @@ lags_sweep <- switch(env_time_type %||% "unknown",
 
 ```
 
+```{r}
+#| label: quarto-metadata
+#| results: asis
+#| echo: false
+
+# Dynamically set Quarto metadata so we can use it in ::: {.content-visible}
+# blocks later.
+cat(sprintf(
+    "\n---\nmulti_location: %s\n---\n",
+    tolower(n_inter_locations > 1)
+))
+```
+
 ---
 
 ## Exploratory Data Analysis {#eda}
@@ -533,15 +546,13 @@ ggplot(df_long, aes(x = time_value, y = value_norm, color = indicator)) +
     )
 ```
 
-```{r}
-#| label: eda-quantiles-text
-#| echo: false
-#| results: asis
-#| eval: !expr n_inter_locations > 1
-cat("### Quantile Trends\n\n")
-cat("This plot displays the distribution of both indicators over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use different scales for the top and bottom panels so each indicator's distribution is clearly visible.\n\n")
-cat("By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.\n\n")
-```
+::: {.content-visible when-meta="multi_location"}
+
+### Quantile Trends
+
+This plot displays the distribution of both indicators over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use different scales for the top and bottom panels so each indicator's distribution is clearly visible.
+
+By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.
 
 ```{r}
 #| label: eda-quantiles
@@ -608,15 +619,11 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
     theme(legend.position = "bottom")
 ```
 
-```{r}
-#| label: eda-aberrant-locations-text
-#| echo: false
-#| results: asis
-#| eval: !expr n_inter_locations > 1
-cat("#### Cross-Sectional Geographic Outliers\n\n")
-cat("While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the cross-sectional 95th percentile recorded on that specific date) for each indicator.\n\n")
-cat("> **Note**: This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than epidemiological aberration.\n\n")
-```
+#### Cross-Sectional Geographic Outliers
+
+While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the cross-sectional 95th percentile recorded on that specific date) for each indicator.
+
+> **Note**: This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than epidemiological aberration.
 
 ```{r}
 #| label: eda-aberrant-locations
@@ -664,6 +671,8 @@ if (nrow(aberrant_locs) > 0) {
     cat("Insufficient data to calculate aberrant time for these locations.\n\n")
 }
 ```
+
+:::
 
 ### Coverage and Missingness
 
@@ -860,15 +869,13 @@ DT::datatable(
 ) %>% DT::formatRound(columns = c(4, 6), digits = 2)
 ```
 
-```{r}
-#| label: eda-noise-text
-#| echo: false
-#| results: asis
-#| eval: !expr n_inter_locations > 1
-cat("### Noise Assessment\n\n")
-cat("We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas.\n\n")
-cat("$$\\text{CV}_i = \\frac{\\text{SD}(X_i)}{|\\bar{X}_i|}$$\n\n")
-```
+::: {.content-visible when-meta="multi_location"}
+
+### Noise Assessment
+
+We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas.
+
+$$\text{CV}_i = \frac{\text{SD}(X_i)}{|\bar{X}_i|}$$
 
 ```{r}
 #| label: eda-noise
@@ -955,6 +962,8 @@ p_scatter <- ggplot(noise_stats_plot, aes(x = guid_cv, y = cand_cv)) +
 
 p_hist / p_scatter + plot_layout(heights = c(1.2, 1))
 ```
+
+:::
 
 ```{r}
 #| label: revision-analysis-setup
