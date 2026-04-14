@@ -11,20 +11,20 @@ format:
     embed-resources: true
 params:
   # Guiding Indicator
-  guiding_source: "hhs"
-  guiding_indicator: "confirmed_admissions_covid_1d"
-  guiding_name:   "COVID Hospital Admissions (HHS)"
+  guiding_source:
+  guiding_indicator:
+  guiding_name:   
   guiding_csv: !expr "NULL"
   # Candidate Indicator
-  candidate_source: "doctor-visits"
-  candidate_indicator: "smoothed_adj_cli"
-  candidate_name:   "Doctor Visits: Smoothed Adj CLI"
+  candidate_source:
+  candidate_indicator:
+  candidate_name: 
   candidate_csv: !expr "NULL"
   # Shared settings
-  geo_type:  "state"
-  time_type: "day"
-  start_day: "2020-09-01"
-  end_day:   "2023-03-01"
+  geo_type:
+  time_type:
+  start_day:
+  end_day:
   # Maximum locations to show in plots/tables
   max_locations_plot: 6
   max_archive_locs: 60

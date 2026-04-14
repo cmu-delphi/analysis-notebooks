@@ -3,31 +3,48 @@
 
 `revision_analysis.qmd` focuses on a single versioned time series and attempts to determine how long, on average, a series continues to receive revisions after its first publication. 
 
-## Running the default analysis
+## Running the analysis
 
-The default indicator is `smoothed_covid19_from_claims` from the
-`hospital-admissions` source, fetched directly from the Delphi API.
+Because this notebook is a generalized template, **it has no default indicator**. You must explicitly provide the required signal and time window parameters when rendering it.
 
 ```bash
-quarto render revision_analysis.qmd
+quarto render revision_analysis.qmd \
+  -P source:hospital-admissions \
+  -P signal:smoothed_covid19_from_claims \
+  -P signal_name:"Hospital Admissions: Smoothed COVID-19" \
+  -P geo_type:state \
+  -P time_type:day \
+  -P start_day:2020-01-01 \
+  -P end_day:2023-12-31
 ```
 
 ```r
-quarto::quarto_render("revision_analysis.qmd")
+quarto::quarto_render(
+  "revision_analysis.qmd",
+  execute_params = list(
+    source      = "hospital-admissions",
+    signal      = "smoothed_covid19_from_claims",
+    signal_name = "Hospital Admissions: Smoothed COVID-19",
+    geo_type    = "state",
+    time_type   = "day",
+    start_day   = "2020-01-01",
+    end_day     = "2023-12-31"
+  )
+)
 ```
 
 ## Parameters
 
 | Parameter               | Description                                                       | Default                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- |
-| `source`                | COVIDcast data source                                             | `hospital-admissions`                                |
-| `signal`                | Signal name                                                       | `smoothed_covid19_from_claims`                       |
-| `signal_name`           | Human-readable label                                              | `Hospital Admissions: Smoothed COVID-19 from Claims` |
+| `source`                | COVIDcast data source                                             | *None (Required)*                                    |
+| `signal`                | Signal name                                                       | *None (Required)*                                    |
+| `signal_name`           | Human-readable label                                              | *None (Required)*                                    |
 | `input`                 | Path to local data (CSV, Parquet, or Directory). `NULL` = use API | `NULL`                                               |
-| `geo_type`              | Geographic level (`state`, `county`, `hhs`, …)                    | `state`                                              |
-| `time_type`             | Time resolution (`day`, `week`)                                   | `day`                                                |
-| `start_day`             | Start of the time_value range (YYYY-MM-DD)                        | `2020-09-01`                                         |
-| `end_day`               | End of the time_value range (YYYY-MM-DD)                          | `2023-03-01`                                         |
+| `geo_type`              | Geographic level (`state`, `county`, `hhs`, …)                    | *None (Required)*                                    |
+| `time_type`             | Time resolution (`day`, `week`)                                   | *None (Required)*                                    |
+| `start_day`             | Start of the time_value range (YYYY-MM-DD)                        | *None (Required)*                                    |
+| `end_day`               | End of the time_value range (YYYY-MM-DD)                          | *None (Required)*                                    |
 | `max_locations_plot`    | Max locations in faceted plots                                    | `6`                                                  |
 | `max_locations_table`   | Rows per page in summary tables                                   | `15`                                                 |
 | `quick_revision`        | Days threshold used in `revision_analysis()` print summary        | `7`                                                  |
@@ -36,24 +53,10 @@ quarto::quarto_render("revision_analysis.qmd")
 
 ## Running on a different signal via the API
 
-```bash
-quarto render revision_analysis.qmd \
-  -P source:doctor-visits \
-  -P signal:smoothed_adj_cli \
-  -P signal_name:"Doctor Visits: Smoothed Adj CLI" \
-  -P geo_type:state
-```
+You can use the provided example scripts in this directory rather than long `quarto` strings in terminal. 
 
-```r
-quarto::quarto_render(
-  "revision_analysis.qmd",
-  execute_params = list(
-    source      = "doctor-visits",
-    signal      = "smoothed_adj_cli",
-    signal_name = "Doctor Visits: Smoothed Adj CLI",
-    geo_type    = "state"
-  )
-)
+```bash
+Rscript revision_analysis_examples.R
 ```
 
 ## Running on local data
@@ -78,7 +81,8 @@ quarto::quarto_render(
   "revision_analysis.qmd",
   execute_params = list(
     input       = "revision_analysis/data/revisions/",
-    signal_name = "My Custom Signal"
+    signal_name = "My Custom Signal",
+    ...
   )
 )
 ```
@@ -86,5 +90,6 @@ quarto::quarto_render(
 ```bash
 quarto render revision_analysis.qmd \
   -P input:revision_analysis/data/revisions/ \
-  -P signal_name:"My Custom Signal"
+  -P signal_name:"My Custom Signal" \
+  ...
 ```

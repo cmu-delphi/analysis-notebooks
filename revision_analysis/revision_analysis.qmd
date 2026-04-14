@@ -17,7 +17,7 @@ params:
   signal_name: 
   # Optional path to a local CSV or Parquet directory with a version/issue column.
   # When NULL, the signal is fetched from the Delphi API with issues = "*".
-  input: NULL
+  input: !expr "NULL"
   # Shared settings
   geo_type:  
   time_type: 
@@ -345,7 +345,7 @@ if (!has_history) {
 
 ## Overall revision summary {#overall}
 
-[`revision_analysis()`](https://delphi.cmu.edu/epiprocess/reference/revision_analysis.html) provides a concise summary of how a signal matures. The results describe the **spread of revisions**, which measures the difference between the minimum and maximum values ever published for an observation. Scaling this by the signal's value gives the **relative spread**. This shows the magnitude of revisions as a percentage. The report also presents **convergence** through the time it takes for data to reach within 20% of its final value. This convergence metric identifies the median duration before an observation enters and stays in its final neighborhood.
+[`revision_analysis()`](https://cmu-delphi.github.io/epiprocess/reference/revision_analysis.html) provides a concise summary of how a signal matures. The results describe the **spread of revisions**, which measures the difference between the minimum and maximum values ever published for an observation. Scaling this by the signal's value gives the **relative spread**. This shows the magnitude of revisions as a percentage. The report also presents **convergence** through the time it takes for data to reach within 20% of its final value. This convergence metric identifies the median duration before an observation enters and stays in its final neighborhood.
 
 ```{r}
 #| label: revision-analysis
