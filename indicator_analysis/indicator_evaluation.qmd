@@ -36,7 +36,7 @@ knitr:
 editor_options: 
   chunk_output_type: console
 execute:
-  cache: true
+  cache: false
 ---
 
 ```{r}
@@ -124,7 +124,7 @@ theme_set(
     theme_minimal(base_family = "Lato", base_size = 12) +
         theme(
             plot.title = ggtext::element_textbox_simple(hjust = 0.5, halign = 0.5, size = 15, face = "bold", margin = margin(b = 6)),
-            plot.subtitle = ggtext::element_textbox_simple(hjust = 0.5, halign = 0.5, color = "gray50", margin = margin(b = 10)),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray50", margin = margin(b = 10)),
             plot.caption = ggtext::element_textbox_simple(hjust = 0, halign = 0, color = "gray50", margin = margin(t = 10)),
             panel.grid = element_line(linetype = 2, linewidth = 0.3, color = "gray90"),
             panel.grid.minor = element_blank(),
@@ -661,17 +661,17 @@ coverage <- coverage %>%
 #| fig-height: !expr min(max(5, length(signals_vec)*2), 12)
 #| echo: true
 ggplot(coverage, aes(x = time_value, y = n_available,
-                     color = indicator, fill = indicator)) +
-    geom_area(linewidth = 0.7, alpha = 0.15) +
+                     color = indicator, linetype = indicator)) +
+    geom_line(linewidth = 0.8) +
     scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
     scale_y_continuous(labels = label_comma(), limits = c(0, NA)) +
     labs(
         title = "Data coverage over time",
         subtitle = sprintf("Number of locations with non-missing values per %s%s", env_time_type,
-                           if (env_time_type != params$time_type &&slide_window > 1) sprintf(" (%d-%s rolling average)", slide_window, env_time_type) else ""),
-        x = "Date", y = "Number of locations"
+                           if (env_time_type != params$time_type && slide_window > 1) sprintf(" (%d-%s rolling average)", slide_window, env_time_type) else ""),
+        x = "Date", y = "Number of locations",
+        color = "Indicator", linetype = "Indicator"
     ) +
-    theme(legend.position = "none") +
     {if (length(signals_vec) > 6) facet_wrap(~indicator, ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
 ```
 
