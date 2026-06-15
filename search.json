@@ -1,23 +1,37 @@
 [
   {
+    "objectID": "indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
+    "href": "indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
+    "title": "Doctor Visits (County) Indicator Analysis",
+    "section": "",
+    "text": "This page provides access to the exploratory data analysis and comparative evaluation reports for doctor visits indicators.\n\n\n Candidate EDA\nEvaluation of the Doctor Visits: Smoothed Adj CLI signal.\n\n View Candidate EDA Report\nExploratory analysis of the candidate indicator’s spatial and temporal coverage, missingness, and data distributions across US counties.\n\n\n\n County Comparison\nComparison against the JHU COVID-19 Cases guiding indicator.\n\n View JHU Cases Comparison Report\nDetailed comparative analysis assessing correlations, lead/lag relationships, and back-revision behavior against JHU Cases data."
+  },
+  {
     "objectID": "index.html",
     "href": "index.html",
-    "title": "Delphi Analysis Notebooks",
+    "title": "Rapid SCAN (Tentative Name)",
     "section": "",
-    "text": "This repository hosts a collection of notebooks and reports for epidemiological analysis."
+    "text": "This repository (tentatively called Rapid SCAN, where SCAN stands for Surveillance Comparison and iNformation) hosts a collection of notebooks and reports for epidemiological analysis."
   },
   {
     "objectID": "index.html#indicator-evaluation",
     "href": "index.html#indicator-evaluation",
-    "title": "Delphi Analysis Notebooks",
+    "title": "Rapid SCAN (Tentative Name)",
     "section": "Indicator Evaluation",
-    "text": "Indicator Evaluation\n\nHHS vs. Doctor Visits (State)\nJHU COVID-19 Cases vs Dr. Visits (County)\nConfirmed Incidence vs. Doctor Visits (County)"
+    "text": "Indicator Evaluation\n\nHHS vs. Doctor Visits (State)\nConfirmed Incidence vs. Doctor Visits (County)"
   },
   {
     "objectID": "index.html#revision-analysis",
     "href": "index.html#revision-analysis",
-    "title": "Delphi Analysis Notebooks",
+    "title": "Rapid SCAN (Tentative Name)",
     "section": "Revision Analysis",
     "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
+  },
+  {
+    "objectID": "indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html",
+    "href": "indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html",
+    "title": "Doctor Visits (HHS) Indicator Analysis",
+    "section": "",
+    "text": "This page provides access to the exploratory data analysis and comparative evaluation reports for doctor visits indicators.\n\n\n Candidate EDA\nEvaluation of the Doctor Visits: Smoothed Adj CLI signal.\n\n View Candidate EDA Report\nExploratory analysis of the candidate indicator’s spatial and temporal coverage, missingness, and data distributions across US states.\n\n\n\n HHS Comparison\nComparison against the COVID Hospital Admissions (HHS) guiding indicator.\n\n View HHS Comparison Report\nDetailed comparative analysis assessing correlations, lead/lag relationships, and back-revision behavior against HHS admissions data."
   }
 ]
