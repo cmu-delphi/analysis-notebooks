@@ -34,6 +34,9 @@ params:
   # Minimum revision history required for reference dates used in diagnostics.
   # Reference dates after render_date - min_revision_history_days are excluded.
   min_revision_history_days: 365
+  # Maximum allowed lag between reference date and first observed report.
+  # Pairs with larger initial lag are treated as historical backfill/archive dumps.
+  max_initial_report_lag_days: 60
 knitr:
   opts_chunk:
     comment: "#>"
@@ -69,13 +72,15 @@ if (!exists("params")) {
         max_locations_table   = 15,
         n_worst               = 18,
         convergence_threshold = 0.05,
-        min_revision_history_days = 365
+        min_revision_history_days = 365,
+        max_initial_report_lag_days = 60
     )
 }
 
-# Load libraries
-if (!require("pak")) install.packages("pak")
-if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delphi/epiprocess@dev")
+options(repos = c(
+    delphi = "https://cmu-delphi.r-universe.dev",
+    CRAN = "https://cloud.r-project.org"
+))
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess, covidcast,
@@ -113,7 +118,7 @@ colours <- c(
 dis_pal <- colours[c(3, 5, 7, 10, 11, 9)]
 
 theme_set(
-    theme_minimal(base_size = 13) +
+    theme_minimal(base_family = "sans", base_size = 13) +
         theme(
             plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
             plot.subtitle = element_text(hjust = 0.5, color = "gray45", size = 12),
@@ -172,6 +177,12 @@ time_range <- function(start, end, time_type = params$time_type) {
     }
 }
 
+as_revision_archive <- function(x) {
+    out <- as_epi_archive(x)
+    out$time_type <- params$time_type
+    out
+}
+
 # Set cache
 cache_path <- file.path(getwd(), "epidatr_cache")
 if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
@@ -200,7 +211,15 @@ as an `epi_archive`. The central question is:
 
 - **Latest report**: For a given location and reference date retained in the diagnostics, the most recent report available in the input data. In this render, diagnostic reference dates must have at least `r params$min_revision_history_days` days of possible revision history, so reference dates after `r render_date - params$min_revision_history_days` are excluded before the latest report is selected.
 
+- **Prospective revision trajectory filter**: A location-reference-date pair is retained only if its first observed report occurs within `r params$max_initial_report_lag_days` days of the reference date. Pairs with larger initial lag are treated as likely historical backfill or one-time archive dumps rather than prospectively observed revision trajectories.
+
 - **Epi season**: A cross-year season used to align respiratory-virus timing. In this notebook, each epi season runs from MMWR week 40 through MMWR week 39 of the following year.
+
+**Analysis settings used in this render**:
+
+- **Minimum observable revision history**: `r params$min_revision_history_days` days. Reference dates after `r render_date - params$min_revision_history_days` are excluded so retained pairs have enough possible follow-up before the render date.
+
+- **Initial report lag cutoff**: `r params$max_initial_report_lag_days` days. Pairs whose first observed report occurs later than this are excluded from revision diagnostics.
 
 **Caution**: The report date used in this notebook is determined entirely by the input data. For data fetched from the Delphi Epidata API, the report date is the provided `issue_date`. This date may reflect a publication rule, model run, file-generation process, or API version tag, rather than the first date when the underlying raw data became available.
 
@@ -260,7 +279,7 @@ if (!is.null(params$input_dir)) {
 
     archive <- raw %>%
         select(geo_value, time_value, version, value) %>%
-        as_epi_archive()
+        as_revision_archive()
 
     msg_verb <- "Loaded"
 } else {
@@ -330,7 +349,7 @@ if (!is.null(params$input_dir)) {
 
     archive <- df_raw %>%
         select(geo_value, time_value, version, value) %>%
-        as_epi_archive()
+        as_revision_archive()
 
     msg_verb <- "Fetched"
 }
@@ -361,6 +380,7 @@ config_tbl <- tibble(
         "Reference date range",
         "Report date range",
         "Minimum revision history",
+        "Maximum initial report lag",
         "Number of locations",
         "Number of reports"
     ),
@@ -373,6 +393,7 @@ config_tbl <- tibble(
         paste(reference_start, "to", reference_end),
         paste(version_start, "to", version_end),
         paste(params$min_revision_history_days, "days"),
+        paste(params$max_initial_report_lag_days, "days"),
         label_comma()(n_locations),
         label_comma()(n_rows)
     )
@@ -406,7 +427,7 @@ max_reference_date <- max(archive$DT$time_value, na.rm = TRUE)
 has_recent_reference_dates <- max_reference_date > stable_reference_cutoff
 diagnostic_archive <- archive$DT %>%
     filter(time_value <= stable_reference_cutoff) %>%
-    as_epi_archive()
+    as_revision_archive()
 ```
 
 ```{r}
@@ -451,13 +472,7 @@ all_pairs <- diagnostic_archive$DT %>%
 analyzed_pairs <- rev_beh %>%
     transmute(geo_value = tolower(geo_value), time_value) %>%
     distinct()
-n_excluded <- nrow(anti_join(all_pairs, analyzed_pairs, by = c("geo_value", "time_value")))
-n_analyzed <- nrow(analyzed_pairs)
-
-# Global metrics for follow-on plots/narrative
-max_lag_days <- as_days(rev_beh$max_lag)
-no_rev_pct <- mean(rev_beh$n_revisions == 0, na.rm = TRUE)
-conv_days_all <- as_days(rev_beh$lag_near_latest)
+n_revision_analysis_excluded <- nrow(anti_join(all_pairs, analyzed_pairs, by = c("geo_value", "time_value")))
 invisible(gc())
 ```
 
@@ -478,7 +493,7 @@ diagnostic_report_df <- diagnostic_archive$DT %>%
 analyzed_report_df <- diagnostic_report_df %>%
     semi_join(analyzed_pairs, by = c("geo_value", "time_value"))
 
-pair_summary <- analyzed_report_df %>%
+pair_summary_unfiltered <- analyzed_report_df %>%
     group_by(geo_value, time_value) %>%
     summarize(
         first_report_date = min(version, na.rm = TRUE),
@@ -497,12 +512,64 @@ pair_summary <- analyzed_report_df %>%
         initial_bias = (first_report_value - latest_report_value) / abs(latest_report_value)
     )
 
-convergence_df <- analyzed_report_df %>%
+pair_summary <- pair_summary_unfiltered %>%
+    filter(initial_lag <= params$max_initial_report_lag_days)
+
+retained_pairs <- pair_summary %>%
+    transmute(geo_value = tolower(geo_value), time_value) %>%
+    distinct()
+
+n_initial_lag_excluded <- nrow(anti_join(
+    pair_summary_unfiltered %>% transmute(geo_value = tolower(geo_value), time_value),
+    retained_pairs,
+    by = c("geo_value", "time_value")
+))
+n_analyzed <- nrow(retained_pairs)
+n_excluded <- n_revision_analysis_excluded + n_initial_lag_excluded
+
+analyzed_report_df <- analyzed_report_df %>%
+    semi_join(retained_pairs, by = c("geo_value", "time_value"))
+
+rev_beh <- rev_beh %>%
+    mutate(geo_value = tolower(geo_value)) %>%
+    semi_join(retained_pairs, by = c("geo_value", "time_value"))
+
+# Global metrics for follow-on plots/narrative after initial-lag filtering.
+max_lag_days <- as_days(rev_beh$max_lag)
+no_rev_pct <- mean(rev_beh$n_revisions == 0, na.rm = TRUE)
+conv_days_all <- as_days(rev_beh$lag_near_latest)
+
+max_publication_lag <- max(analyzed_report_df$publication_lag, na.rm = TRUE)
+
+convergence_observed_df <- analyzed_report_df %>%
     inner_join(
         pair_summary %>% select(geo_value, time_value, value_latest = latest_report_value),
         by = c("geo_value", "time_value")
     ) %>%
     mutate(abs_rel_diff = abs(value - value_latest) / abs(value_latest))
+
+completed_report_df <- analyzed_report_df %>%
+    arrange(geo_value, time_value, publication_lag, version) %>%
+    group_by(geo_value, time_value) %>%
+    tidyr::complete(
+        publication_lag = seq(0, max_publication_lag, by = 1)
+    ) %>%
+    arrange(publication_lag, .by_group = TRUE) %>%
+    tidyr::fill(value, version, .direction = "down") %>%
+    ungroup()
+
+convergence_df <- completed_report_df %>%
+    inner_join(
+        pair_summary %>% select(geo_value, time_value, value_latest = latest_report_value),
+        by = c("geo_value", "time_value")
+    ) %>%
+    mutate(
+        abs_rel_diff = if_else(
+            is.na(value),
+            1,
+            abs(value - value_latest) / abs(value_latest)
+        )
+    )
 invisible(gc())
 ```
 
@@ -551,14 +618,11 @@ epi_season_label <- function(date) {
     paste0(start_year, "-", start_year + 1L)
 }
 
-season_levels <- convergence_df %>%
+season_levels <- pair_summary %>%
     mutate(epi_season = epi_season_label(time_value)) %>%
     distinct(epi_season) %>%
     arrange(epi_season) %>%
     pull(epi_season)
-
-convergence_season_df <- convergence_df %>%
-    mutate(epi_season = factor(epi_season_label(time_value), levels = season_levels))
 
 plot_to_data_uri <- function(plot, width = 12, height = 8, dpi = 120) {
     out_file <- tempfile(fileext = ".png")
@@ -583,8 +647,13 @@ hhs_region_map <- tribble(
 
 ## Results at a glance {#overall .unnumbered}
 
-The time-series plot below compares the Report value available at selected lags
-using all reference dates in the analysis period.
+The time-series plot below compares the Report value available at selected as-of
+lags among the retained prospective revision trajectories. For revision-pattern
+and accuracy views in the main sections, trajectories are carried forward between
+observed reports: if no new revision is published at a lag, the most recent
+previous Report value is used as the as-of value. Later lag and revision-event
+diagnostics use observed report records directly, where no revision means no new
+record.
 
 ```{r}
 #| label: report-values-by-lag
@@ -594,45 +663,20 @@ using all reference dates in the analysis period.
 report_lags <- c(0, 7, 14, 30, 60, 90, 120, 180)
 report_lag_levels <- c(paste0(report_lags, "d"), "Latest")
 
-report_archive_df <- archive$DT %>%
+as_of_lag_df <- completed_report_df %>%
+    filter(publication_lag %in% report_lags, !is.na(value)) %>%
+    mutate(report_lag = paste0(publication_lag, "d")) %>%
+    select(geo_value, time_value, version, value, publication_lag, report_lag)
+
+latest_report_df <- pair_summary %>%
     transmute(
-        geo_value = tolower(geo_value),
+        geo_value,
         time_value,
-        version,
-        value,
-        publication_lag = as.numeric(version - time_value, units = "days")
-    ) %>%
-    filter(publication_lag >= 0, !is.na(value))
-
-report_archive_dt <- as.data.table(report_archive_df)
-setorder(report_archive_dt, geo_value, time_value, publication_lag, version)
-
-as_of_lag_df <- report_archive_dt[
-    ,
-    {
-        lag_index <- findInterval(report_lags, publication_lag)
-        lag_keep <- lag_index > 0
-
-        if (!any(lag_keep)) {
-            .SD[0][, report_lag := character()]
-        } else {
-            .SD[lag_index[lag_keep]][
-                ,
-                report_lag := paste0(report_lags[lag_keep], "d")
-            ]
-        }
-    },
-    by = .(geo_value, time_value)
-] %>%
-    as_tibble()
-
-latest_report_df <- report_archive_dt[
-    ,
-    .SD[.N],
-    by = .(geo_value, time_value)
-] %>%
-    as_tibble() %>%
-    mutate(report_lag = "Latest")
+        version = latest_report_date,
+        value = latest_report_value,
+        publication_lag = as.numeric(latest_report_date - time_value, units = "days"),
+        report_lag = "Latest"
+    )
 
 report_lag_timeseries <- bind_rows(as_of_lag_df, latest_report_df) %>%
     mutate(report_lag = factor(report_lag, levels = report_lag_levels)) %>%
@@ -649,8 +693,8 @@ report_lag_cols <- setNames(
 report_lag_date_end <- max(report_lag_timeseries$time_value, na.rm = TRUE)
 
 report_lag_subtitle_base <- paste(
-    "Each line shows the selected state's Report value using reports available as of the selected lag.",
-    "This view uses all reference dates in the analysis period.",
+    "Each line shows the selected state's Report value available as of the selected lag.",
+    "Observed values are carried forward between reports; retained pairs satisfy the initial report lag cutoff.",
     sep = "\n"
 )
 
@@ -879,12 +923,14 @@ value in the latest report for the same location and reference date.
 A Relative Error of 0% means the current report matches the latest report; a Relative Error of 10%
 means it is still 10% away from the latest report.
 
-This heatmap shows the Relative Error surface over daily reference date and lag.
-Each cell summarizes the mean Relative Error across all states for reports with
-the same reference date and lag. Epi seasons are shown one page at a time, with the
-most recent epi season first. White cells mean that no report was available for that
-reference-date and lag combination, so they should be read as missing data rather
-than zero Relative Error.
+This heatmap shows the Relative Error surface over daily reference date and as-of
+lag. Each location-reference-date trajectory is carried forward between observed
+reports: if no new report was issued at a lag, the previous Report value remains
+the as-of value for that lag. Each cell summarizes the mean Relative Error across
+all states for the same reference date and as-of lag. Epi seasons are shown one
+page at a time, with the most recent epi season first. White cells mean that no
+Report value was available yet for that reference-date and lag combination, so
+they should be read as missing data rather than zero Relative Error.
 
 ```{r}
 #| label: relative-error-heatmap
@@ -903,8 +949,9 @@ season_axis_end <- as.numeric(as.Date("2001-10-01") - as.Date("2000-10-01"))
 heatmap_focus_days <- 180
 heatmap_day_breaks <- c(0, 7, 14, 30, 60, 90, 120, 150, 180)
 
-heatmap_df <- convergence_season_df %>%
+heatmap_df <- convergence_df %>%
     filter(publication_lag >= 0, publication_lag <= heatmap_focus_days) %>%
+    mutate(epi_season = factor(epi_season_label(time_value), levels = season_levels)) %>%
     filter(!is.na(epi_season)) %>%
     mutate(
         season_start = season_start_date(epi_season),
@@ -1223,12 +1270,16 @@ location-reference-date pair enters the threshold, it must stay there.
 ```{r}
 #| label: stability-compute
 #| cache: true
-thresholds <- c(0.5, 0.2, 0.1, 0.05, 0.01, 0.005)
+thresholds <- c(0.5, 0.2, 0.1, 0.05, 0.01, 0.005, 0)
 threshold_label <- function(x) {
-    ifelse(x < 0.01, label_percent(accuracy = 0.1)(x), label_percent(accuracy = 1)(x))
+    case_when(
+        x == 0 ~ "0%",
+        x < 0.01 ~ label_percent(accuracy = 0.1)(x),
+        TRUE ~ label_percent(accuracy = 1)(x)
+    )
 }
 
-stability_multi <- convergence_df %>%
+stability_multi <- convergence_observed_df %>%
     arrange(geo_value, time_value, publication_lag) %>%
     group_by(geo_value, time_value) %>%
     group_modify(function(df, key) {
@@ -1249,16 +1300,7 @@ stability_multi <- convergence_df %>%
     }) %>%
     ungroup()
 
-rev_window_df <- rev_beh %>%
-    filter(n_revisions > 0) %>%
-    transmute(
-        geo_value, time_value,
-        lag_stable = as_days(max_lag),
-        threshold = "0%",
-        threshold_num = 0
-    )
-
-stability_combined <- bind_rows(stability_multi, rev_window_df) %>%
+stability_combined <- stability_multi %>%
     mutate(threshold = factor(threshold, levels = threshold_levels))
 invisible(gc())
 ```
@@ -1504,8 +1546,14 @@ stability_combined %>%
 
 ### Relative Error by lag
 
-This view summarizes Relative Error at each lag. The line is the median across
-reports, and the band shows the 25th-75th percentile range.
+This view summarizes Relative Error at each as-of lag. Each
+location-reference-date trajectory is carried forward between observed reports,
+so lags with no new report use the previous Report value. Lags before the first
+observed report are assigned 100% Relative Error, which keeps every lag on the
+same location-reference-date denominator and treats not-yet-available reports as
+not yet close to the latest Report value. The line is the median across all
+analyzed location-reference-date pairs, and the band shows the 25th-75th
+percentile range.
 The x-axis is split: the left panel shows early lags, and the right panel shows
 the long tail. Days between the two panels are intentionally omitted and should
 not be read as continuous spacing.
@@ -1520,10 +1568,10 @@ overall_conv <- convergence_df %>%
         q25_rel_diff = quantile(abs_rel_diff, 0.25, na.rm = TRUE),
         median_rel_diff = median(abs_rel_diff, na.rm = TRUE),
         q75_rel_diff = quantile(abs_rel_diff, 0.75, na.rm = TRUE),
-        n_reports = n(),
+        n_asof_pairs = n(),
         .groups = "drop"
     ) %>%
-    filter(n_reports > 5)
+    filter(n_asof_pairs > 5)
 
 convergence_focus_days <- focus_days
 max_conv_day <- max(overall_conv$publication_lag, na.rm = TRUE)
@@ -2133,17 +2181,18 @@ each season.
 #| label: relative-error-by-season
 #| fig-height: 5
 #| cache: true
-season_conv <- convergence_season_df %>%
+season_conv <- convergence_df %>%
+    filter(publication_lag <= convergence_focus_days) %>%
+    mutate(epi_season = factor(epi_season_label(time_value), levels = season_levels)) %>%
     group_by(epi_season, publication_lag) %>%
     summarize(
         q25_rel_diff = quantile(abs_rel_diff, 0.25, na.rm = TRUE),
         median_rel_diff = median(abs_rel_diff, na.rm = TRUE),
         q75_rel_diff = quantile(abs_rel_diff, 0.75, na.rm = TRUE),
-        n_reports = n(),
+        n_asof_pairs = n(),
         .groups = "drop"
     ) %>%
-    filter(n_reports > 5) %>%
-    filter(publication_lag <= convergence_focus_days)
+    filter(n_asof_pairs > 5)
 
 ggplot(season_conv, aes(x = publication_lag, color = epi_season, fill = epi_season)) +
     geom_ribbon(
@@ -2384,7 +2433,9 @@ ggplot(initial_lag_revision_df, aes(x = publication_lag, color = initial_lag_gro
 
 These diagnostics are useful for checking data support and broad
 revision patterns, but they are secondary to the main interpretation sections
-above.
+above. Unlike the main as-of accuracy views, the diagnostics in this section use
+observed report records directly: if no revision was published at a lag, no new
+record is counted for that lag.
 
 ### Overall revision diagnostics
 
@@ -2416,13 +2467,17 @@ fmt_stats  <- function(s) paste(names(s), round(as.numeric(s), 1), sep = ": ", c
 
 if (n_excluded > 0) {
     cat(sprintf(
-        "::: {.callout-important}\n`revision_analysis()` requires at least one report after the waiting period to assess revision behavior. %d location-reference-date pair(s) were excluded because they only have an initial report with no subsequent reports yet. The %d remaining pairs are used for all analyses below.\n:::\n\n",
-        n_excluded, n_analyzed
+        "::: {.callout-important}\n%d location-reference-date pair(s) were excluded before the main diagnostics: %d because `revision_analysis()` could not assess revision behavior, and %d because their first observed report lag exceeded the initial report lag cutoff of %d days. The %d remaining pairs are used for the diagnostics below.\n:::\n\n",
+        n_excluded,
+        n_revision_analysis_excluded,
+        n_initial_lag_excluded,
+        params$max_initial_report_lag_days,
+        n_analyzed
     ))
 }
 cat(sprintf(
     "- **Time range**: %s to %s\n",
-    rev_result$range_time_values[1], rev_result$range_time_values[2]
+    min(pair_summary$time_value), max(pair_summary$time_value)
 ))
 cat(sprintf("- **Min lag (days to first report)**: %s\n", fmt_stats(lag_stats)))
 cat(sprintf("- **No revisions**: %s\n", label_percent()(no_rev_pct)))
@@ -2561,7 +2616,7 @@ helps separate initial reporting timing from later revisions.
 ```{r}
 #| label: backfill-gap-compute
 #| cache: true
-backfill_df <- diagnostic_report_df %>%
+backfill_df <- analyzed_report_df %>%
     group_by(geo_value, time_value) %>%
     mutate(
         backfill_gap = publication_lag,
@@ -2744,7 +2799,7 @@ shows the 25th-75th percentile range.
 #| echo: false
 #| fig-height: 4.5
 #| cache: true
-rev_count_df <- diagnostic_report_df %>%
+rev_count_df <- analyzed_report_df %>%
     group_by(geo_value, time_value) %>%
     summarize(n_revisions = n_distinct(version) - 1L, .groups = "drop")
 
@@ -2808,6 +2863,101 @@ backfill_df %>%
     theme(strip.text.x = element_text(size = 12, face = "bold"))
 ```
 
+### Proportion of revisions by weekday
+
+This diagnostic shows which weekdays revisions are published on. Locations are
+pooled together, and each panel is one report year. First reports are excluded
+so the figure focuses on follow-up revision activity rather than initial
+publication timing.
+
+```{r}
+#| label: revision-weekday-proportion
+#| fig-height: 7
+#| cache: true
+weekday_levels <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+actual_report_weekday_path <- here::here(
+    "revision_analysis",
+    "data",
+    "nhsn_confirmed_admissions_covid_ew_archive.csv"
+)
+use_actual_report_weekday_file <- identical(params$source, "nhsn") &&
+    identical(params$signal, "confirmed_admissions_covid_ew") &&
+    file.exists(actual_report_weekday_path)
+
+revision_weekday_source_df <- if (use_actual_report_weekday_file) {
+    data.table::fread(
+        actual_report_weekday_path,
+        select = c("geo_value", "time_value", "version", "value")
+    ) %>%
+        as_tibble() %>%
+        transmute(
+            geo_value = tolower(geo_value),
+            time_value = as.Date(time_value),
+            version = as.Date(version),
+            value
+        ) %>%
+        semi_join(retained_pairs, by = c("geo_value", "time_value")) %>%
+        distinct(geo_value, time_value, version, .keep_all = TRUE) %>%
+        group_by(geo_value, time_value) %>%
+        mutate(is_initial_release = version == min(version, na.rm = TRUE)) %>%
+        ungroup()
+} else {
+    backfill_df
+}
+
+weekday_subtitle <- if (use_actual_report_weekday_file) {
+    "Follow-up revision records only; locations pooled within each report year. Weekday uses original, unaligned report dates."
+} else {
+    "Follow-up revision records only; locations pooled within each report year. Weekday uses the report dates available in the analysis input."
+}
+
+revision_weekday_df <- revision_weekday_source_df %>%
+    filter(!is_initial_release) %>%
+    mutate(
+        report_year = lubridate::year(version),
+        report_weekday = factor(
+            weekdays(as.Date(version)),
+            levels = weekday_levels
+        )
+    ) %>%
+    count(report_year, report_weekday, name = "n_revisions") %>%
+    tidyr::complete(
+        report_year,
+        report_weekday = factor(weekday_levels, levels = weekday_levels),
+        fill = list(n_revisions = 0)
+    ) %>%
+    group_by(report_year) %>%
+    mutate(
+        total_revisions = sum(n_revisions),
+        revision_proportion = if_else(total_revisions > 0, n_revisions / total_revisions, NA_real_)
+    ) %>%
+    ungroup() %>%
+    filter(total_revisions > 0)
+
+if (nrow(revision_weekday_df) == 0) {
+    ggplot() +
+        annotate("text", x = 0, y = 0, label = "No follow-up revisions available after filtering.") +
+        theme_void()
+} else {
+    ggplot(revision_weekday_df, aes(x = report_weekday, y = revision_proportion, fill = report_weekday)) +
+        geom_col(width = 0.82, alpha = 0.88) +
+        facet_wrap(~report_year, ncol = 2) +
+        scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
+        scale_fill_manual(values = rep(dis_pal, length.out = length(weekday_levels)), guide = "none") +
+        labs(
+            title = "Proportion of revisions by report weekday",
+            subtitle = weekday_subtitle,
+            x = NULL,
+            y = "Share of revisions"
+        ) +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+            strip.text = element_text(face = "bold")
+        )
+}
+```
+
 ## Summary {#summary}
 
 ```{r}
@@ -2825,7 +2975,7 @@ pct_under <- label_percent()(mean(bias_by_loc$median_bias < 0))
 cat(sprintf(
     "For **%s** (`%s / %s`), the diagnostic reference dates covering %s to %s\nshow the following revision and backfill profile:\n\n",
     params$signal_name, params$source, params$signal,
-    rev_result$range_time_values[1], rev_result$range_time_values[2]
+    min(pair_summary$time_value), max(pair_summary$time_value)
 ))
 
 cat(sprintf("- **%s** of location-reference-date pairs were never revised after their first published Report value.\n", p_no_rev))
