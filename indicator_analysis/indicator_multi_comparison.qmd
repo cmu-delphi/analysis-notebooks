@@ -111,7 +111,6 @@ theme_set(
     theme_minimal(base_family = "sans", base_size = 14) +
         theme(
             plot.title = element_text(hjust = 0.5, size = 17, face = "bold"),
-            plot.subtitle = element_text(hjust = 0.5, size = 13, color = "gray45"),
             plot.caption = element_text(hjust = 0, size = 11, color = "gray45"),
             axis.title = element_text(size = 14),
             axis.text = element_text(size = 12),
@@ -181,22 +180,102 @@ lag_palette <- function(n) {
     grDevices::hcl.colors(n, palette = "Dark 3")
 }
 
-wrap_legend_label <- function(x, width = 26) {
-    stringr::str_wrap(x, width = width)
+wrap_legend_label <- function(x) {
+    stringr::str_squish(stringr::str_replace_all(x, "\n", " "))
+}
+
+vertical_indicator_axis <- function(text_size = 10) {
+    theme(
+        axis.text.x = element_text(
+            angle = 90,
+            hjust = 1,
+            vjust = 0.5,
+            size = text_size,
+            lineheight = 0.95
+        ),
+        plot.margin = margin(t = 6, r = 12, b = 18, l = 12)
+    )
 }
 
 safe_bottom_legend <- function(text_size = 10) {
     theme(
         legend.position = "bottom",
         legend.box = "vertical",
+        legend.direction = "horizontal",
         legend.justification = "center",
+        legend.title.position = "top",
         legend.text = element_text(size = text_size),
-        legend.title = element_text(size = text_size + 1),
-        legend.key.width = grid::unit(1.25, "lines"),
+        legend.title = element_text(size = text_size + 1, hjust = 0.5),
+        legend.key.width = grid::unit(1.6, "lines"),
         legend.key.height = grid::unit(0.9, "lines"),
         legend.margin = margin(t = 2, r = 2, b = 2, l = 2),
         legend.box.margin = margin(t = 2, r = 2, b = 2, l = 2)
     )
+}
+
+reference_guide <- function(override.aes = list()) {
+    guide_legend(
+        ncol = 1,
+        byrow = TRUE,
+        title.position = "top",
+        title.hjust = 0.5,
+        override.aes = override.aes
+    )
+}
+
+nowrap_datatable <- function(data, ..., options = list()) {
+    default_options <- list(
+        scrollX = TRUE,
+        autoWidth = TRUE,
+        columnDefs = list(list(className = "dt-nowrap", targets = "_all"))
+    )
+    merged_options <- utils::modifyList(default_options, options)
+
+    DT::datatable(
+        data,
+        ...,
+        options = merged_options,
+        class = "stripe hover row-border nowrap"
+    ) %>%
+        DT::formatStyle(
+            columns = names(data),
+            `white-space` = "nowrap"
+        )
+}
+
+matrix_spearman_many_to_many <- function(dat, group_cols, ref_cols, ref_lookup, min_n = 3) {
+    ref_pairs <- combn(ref_cols, 2, simplify = FALSE)
+    if (length(ref_pairs) == 0) {
+        return(tibble())
+    }
+
+    grouped <- dat %>%
+        group_by(across(all_of(group_cols)))
+
+    keys <- group_keys(grouped)
+    chunks <- group_split(grouped)
+
+    map2_dfr(chunks, seq_along(chunks), function(chunk, idx) {
+        y <- as.matrix(chunk[, ref_cols, drop = FALSE])
+        cor_mat <- suppressWarnings(cor(y, method = "spearman", use = "pairwise.complete.obs"))
+
+        pair_tbl <- map_dfr(ref_pairs, function(pair) {
+            ok <- complete.cases(chunk[[pair[1]]], chunk[[pair[2]]])
+            has_enough <- sum(ok) >= min_n &&
+                n_distinct(chunk[[pair[1]]][ok]) >= 2 &&
+                n_distinct(chunk[[pair[2]]][ok]) >= 2
+            tibble(
+                ref_col_1 = pair[1],
+                ref_col_2 = pair[2],
+                n = sum(ok),
+                cor = if_else(has_enough, cor_mat[pair[1], pair[2]], NA_real_)
+            )
+        })
+
+        bind_cols(keys[idx, , drop = FALSE], pair_tbl)
+    }) %>%
+        left_join(ref_lookup %>% rename(reference_id_1 = reference_id, reference_name_1 = reference_name, reference_label_1 = reference_label), by = c("ref_col_1" = "ref_col")) %>%
+        left_join(ref_lookup %>% rename(reference_id_2 = reference_id, reference_name_2 = reference_name, reference_label_2 = reference_label), by = c("ref_col_2" = "ref_col"))
 }
 
 safe_spearman <- function(x, y, min_n = 3) {
@@ -205,6 +284,40 @@ safe_spearman <- function(x, y, min_n = 3) {
         return(NA_real_)
     }
     suppressWarnings(cor(x[ok], y[ok], method = "spearman"))
+}
+
+matrix_spearman_one_to_many <- function(dat, group_cols, x_col, ref_cols, ref_lookup, min_n = 3) {
+    grouped <- dat %>%
+        group_by(across(all_of(group_cols)))
+
+    keys <- group_keys(grouped)
+    chunks <- group_split(grouped)
+
+    map2_dfr(chunks, seq_along(chunks), function(chunk, idx) {
+        x <- chunk[[x_col]]
+        y <- as.matrix(chunk[, ref_cols, drop = FALSE])
+
+        n_pairs <- colSums(!is.na(y) & !is.na(x))
+        x_has_variation <- map_lgl(seq_along(ref_cols), function(j) {
+            ok <- !is.na(x) & !is.na(y[, j])
+            n_pairs[j] >= min_n && n_distinct(x[ok]) >= 2
+        })
+        y_has_variation <- map_lgl(seq_along(ref_cols), function(j) {
+            ok <- !is.na(x) & !is.na(y[, j])
+            n_pairs[j] >= min_n && n_distinct(y[ok, j]) >= 2
+        })
+
+        cors <- suppressWarnings(cor(x, y, method = "spearman", use = "pairwise.complete.obs")) %>%
+            as.numeric()
+        cors[!(n_pairs >= min_n & x_has_variation & y_has_variation)] <- NA_real_
+
+        bind_cols(
+            keys[idx, , drop = FALSE],
+            tibble(ref_col = ref_cols, n = as.integer(n_pairs), cor = cors)
+        )
+    }) %>%
+        left_join(ref_lookup, by = "ref_col") %>%
+        select(-ref_col)
 }
 
 zscore_safe <- function(x) {
@@ -353,7 +466,7 @@ if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
 set_cache(cache_dir = cache_path)
 ```
 
-This notebook is the multi-reference version of the standard indicator comparison report. It evaluates one **candidate indicator** against multiple **reference indicators** in the same render. Every diagnostic is computed separately for each candidate/reference pair; reference indicators are not combined into a composite score.
+This report evaluates one **candidate indicator** against multiple **reference indicators**. Each diagnostic is computed pairwise; references are not combined.
 
 ```{r}
 #| label: print-config
@@ -402,22 +515,15 @@ config_tbl <- bind_rows(
         )
 )
 
-DT::datatable(config_tbl, caption = sprintf(
+nowrap_datatable(config_tbl, caption = sprintf(
     "Geo-level: %s | Period: %s to %s",
     params$geo_type, params$start_day, params$end_day
 ), rownames = FALSE, options = list(scrollX = TRUE, dom = "t"))
 ```
 
----
-
-## Data Loading {#data}
-
-The report loads the candidate once and each reference once, then creates candidate/reference panels by joining on location and time. All diagnostics below use the overlapping rows for each candidate/reference pair. This keeps the report equivalent to running several one-to-one comparisons, but avoids repeated downloads, repeated candidate storage, and repeated renders.
-
 ```{r}
 #| label: load-data
-#| echo: false
-#| results: asis
+#| include: false
 df_candidate <- load_indicator(
     source = params$candidate_source,
     indicator = params$candidate_indicator,
@@ -470,18 +576,11 @@ reference_load_tbl <- df_references %>%
         last_date
     )
 
-DT::datatable(
-    reference_load_tbl,
-    caption = "Loaded reference indicators",
-    rownames = FALSE,
-    options = list(scrollX = TRUE, pageLength = 10)
-)
 ```
 
 ```{r}
 #| label: combine-data
-#| echo: false
-#| results: asis
+#| include: false
 env_time_type <- attributes(df_candidate)$metadata$time_type
 if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
     env_time_type <- params$time_type
@@ -496,7 +595,7 @@ if (env_time_type == "week") {
 
     df_references <- df_references %>%
         mutate(time_value = round_to_sunday(time_value)) %>%
-        group_by(reference_id, reference_source, reference_indicator, reference_name, geo_value, time_value) %>%
+        group_by(reference_id, reference_source, reference_indicator, reference_name, reference_label, geo_value, time_value) %>%
         summarize(value = mean(value, na.rm = TRUE), .groups = "drop")
 
     cat("- Aligned candidate and reference indicators to Sunday-start weeks  \n")
@@ -516,7 +615,7 @@ df_pair <- df_references %>%
             select(geo_value, time_value, candidate = value),
         by = c("geo_value", "time_value")
     ) %>%
-    group_by(reference_id, reference_source, reference_indicator, reference_name, geo_value) %>%
+    group_by(reference_id, reference_source, reference_indicator, reference_name, reference_label, geo_value) %>%
     complete(
         time_value = seq.Date(
             from = grid_start,
@@ -548,14 +647,6 @@ intersection_tbl <- df_pair %>%
         intersection_pct = replace_na(intersection_pct, 0)
     )
 
-DT::datatable(
-    intersection_tbl %>%
-        mutate(intersection_pct = sprintf("%.1f%%", intersection_pct)),
-    caption = "Candidate/reference overlap",
-    rownames = FALSE,
-    options = list(scrollX = TRUE, pageLength = 10)
-)
-
 time_unit <- switch(env_time_type %||% "unknown",
     week = "weeks",
     month = "months",
@@ -586,13 +677,38 @@ ref_cols <- reference_palette(sort(unique(df_inter$reference_label)))
 ```{r}
 #| label: core-metrics
 #| include: false
-cor_by_time <- df_inter %>%
-    group_by(reference_id, reference_name, reference_label, time_value) %>%
-    summarize(
-        n_locations = n_distinct(geo_value),
-        cor = safe_spearman(candidate, reference),
-        .groups = "drop"
-    )
+ref_lookup <- reference_specs %>%
+    mutate(ref_col = paste0("ref_", row_number())) %>%
+    select(ref_col, reference_id, reference_name, reference_label)
+
+ref_ids <- ref_lookup$ref_col
+
+reference_wide <- df_references %>%
+    mutate(geo_value = as.character(geo_value)) %>%
+    select(geo_value, time_value, reference_id, value) %>%
+    left_join(ref_lookup %>% select(ref_col, reference_id), by = "reference_id") %>%
+    distinct(geo_value, time_value, ref_col, .keep_all = TRUE) %>%
+    select(geo_value, time_value, ref_col, value) %>%
+    pivot_wider(names_from = ref_col, values_from = value)
+
+missing_ref_cols <- setdiff(ref_ids, names(reference_wide))
+if (length(missing_ref_cols) > 0) {
+    reference_wide[missing_ref_cols] <- NA_real_
+}
+
+metric_wide <- df_candidate %>%
+    mutate(geo_value = as.character(geo_value)) %>%
+    select(geo_value, time_value, candidate = value) %>%
+    full_join(reference_wide, by = c("geo_value", "time_value"))
+
+cor_by_time <- matrix_spearman_one_to_many(
+    dat = metric_wide,
+    group_cols = "time_value",
+    x_col = "candidate",
+    ref_cols = ref_ids,
+    ref_lookup = ref_lookup
+) %>%
+    rename(n_locations = n)
 
 mean_geo_cor <- cor_by_time %>%
     group_by(reference_id, reference_name, reference_label) %>%
@@ -607,13 +723,14 @@ mean_geo_cor <- cor_by_time %>%
         .groups = "drop"
     )
 
-cor_by_geo <- df_inter %>%
-    group_by(reference_id, reference_name, reference_label, geo_value) %>%
-    summarize(
-        n_dates = n_distinct(time_value),
-        cor = safe_spearman(candidate, reference),
-        .groups = "drop"
-    )
+cor_by_geo <- matrix_spearman_one_to_many(
+    dat = metric_wide,
+    group_cols = "geo_value",
+    x_col = "candidate",
+    ref_cols = ref_ids,
+    ref_lookup = ref_lookup
+) %>%
+    rename(n_dates = n)
 
 temporal_summary <- cor_by_geo %>%
     group_by(reference_id, reference_name, reference_label) %>%
@@ -635,18 +752,26 @@ candidate_lagged <- df_candidate %>%
     mutate(time_value = add_lag_units(candidate_time_value, lag, env_time_type)) %>%
     select(geo_value, time_value, lag, candidate)
 
-df_lagged <- df_references %>%
-    select(reference_id, reference_source, reference_indicator, reference_name, reference_label, geo_value, time_value, reference = value) %>%
-    inner_join(candidate_lagged, by = c("geo_value", "time_value")) %>%
-    filter(!is.na(candidate), !is.na(reference))
+lagged_wide <- candidate_lagged %>%
+    inner_join(reference_wide, by = c("geo_value", "time_value"))
 
-cor_sweep_geo <- df_lagged %>%
-    group_by(reference_id, reference_name, reference_label, lag, geo_value) %>%
-    summarize(
-        n_dates = n_distinct(time_value),
-        cor = safe_spearman(candidate, reference),
-        .groups = "drop"
-    )
+cor_sweep_geo <- matrix_spearman_one_to_many(
+    dat = lagged_wide,
+    group_cols = c("lag", "geo_value"),
+    x_col = "candidate",
+    ref_cols = ref_ids,
+    ref_lookup = ref_lookup
+) %>%
+    rename(n_dates = n)
+
+cor_lagged_time <- matrix_spearman_one_to_many(
+    dat = lagged_wide %>% filter(lag %in% lag_values),
+    group_cols = c("lag", "time_value"),
+    x_col = "candidate",
+    ref_cols = ref_ids,
+    ref_lookup = ref_lookup
+) %>%
+    rename(n_locations = n)
 
 lag_summary <- cor_sweep_geo %>%
     group_by(reference_id, reference_name, reference_label, lag) %>%
@@ -665,23 +790,164 @@ optimal_lag <- lag_summary %>%
     group_by(reference_id, reference_name, reference_label) %>%
     slice_max(mean_cor, n = 1, with_ties = FALSE) %>%
     ungroup()
-```
 
----
+reference_agreement_by_time <- matrix_spearman_many_to_many(
+    dat = metric_wide,
+    group_cols = "time_value",
+    ref_cols = ref_ids,
+    ref_lookup = ref_lookup
+)
+
+reference_agreement_summary <- reference_agreement_by_time %>%
+    group_by(reference_id_1, reference_name_1, reference_label_1, reference_id_2, reference_name_2, reference_label_2) %>%
+    summarize(
+        mean_cor = mean(cor, na.rm = TRUE),
+        median_cor = median(cor, na.rm = TRUE),
+        p25_cor = quantile(cor, 0.25, na.rm = TRUE),
+        p75_cor = quantile(cor, 0.75, na.rm = TRUE),
+        dates = sum(!is.na(cor)),
+        .groups = "drop"
+    ) %>%
+    mutate(pair_label = paste(reference_label_1, reference_label_2, sep = " vs "))
+
+reference_agreement_matrix <- bind_rows(
+    reference_agreement_summary %>%
+        transmute(row_reference = reference_label_1, col_reference = reference_label_2, mean_cor),
+    reference_agreement_summary %>%
+        transmute(row_reference = reference_label_2, col_reference = reference_label_1, mean_cor),
+    ref_lookup %>%
+        transmute(row_reference = reference_label, col_reference = reference_label, mean_cor = 1)
+)
+
+lag_concordance <- optimal_lag %>%
+    mutate(
+        optimal_lag = lag,
+        lead_direction = case_when(
+            lag > 0 ~ "Candidate leads",
+            lag < 0 ~ "Candidate lags",
+            lag == 0 ~ "Synchronous",
+            TRUE ~ "No estimate"
+        )
+    )
+
+weak_spatial_dates <- cor_by_time %>%
+    filter(is.finite(cor)) %>%
+    group_by(reference_id, reference_name, reference_label) %>%
+    slice_min(cor, n = 5, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(reference_name, cor)
+
+weak_temporal_locations <- cor_sweep_geo %>%
+    inner_join(optimal_lag %>% select(reference_id, optimal_lag = lag), by = "reference_id") %>%
+    filter(lag == optimal_lag, is.finite(cor)) %>%
+    mutate(geo_name = geo_to_name(geo_value)) %>%
+    group_by(reference_id, reference_name, reference_label) %>%
+    slice_min(cor, n = 5, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(reference_name, cor)
+
+agreement_consistency <- bind_rows(
+    mean_geo_cor %>%
+        transmute(reference_id, reference_name, reference_label, metric = "Mean spatial correlation", value = mean_cor),
+    temporal_summary %>%
+        transmute(reference_id, reference_name, reference_label, metric = "Median temporal correlation", value = median_cor),
+    optimal_lag %>%
+        transmute(reference_id, reference_name, reference_label, metric = "Mean correlation at optimal lag", value = mean_cor)
+) %>%
+    mutate(metric = factor(metric, levels = c("Mean spatial correlation", "Median temporal correlation", "Mean correlation at optimal lag")))
+```
 
 ## Exploratory Data Analysis {#eda}
 
-Before comparing correlations, this section checks whether each candidate/reference pair has enough usable overlap and whether the indicators have broadly comparable behavior. These views mirror the original one-to-one comparison report, but the same calculations are grouped by reference indicator.
+This section checks overlap, scale, missingness, and variation for each candidate/reference pair.
+
+### Data Sources and Pairwise Overlap
+
+The candidate and references are loaded once, then paired by location and time. Dashed vertical lines mark the requested analysis window; overlap values are pairwise with the candidate.
+
+```{r}
+#| label: eda-data-source-overlap
+#| echo: false
+#| fig-height: 8.8
+reference_source_plot <- reference_load_tbl %>%
+    left_join(intersection_tbl %>% select(reference_name, intersected_rows, intersected_locations, intersected_dates, intersection_pct), by = "reference_name") %>%
+    mutate(reference_label = wrap_reference(reference_name, width = 34))
+
+candidate_context <- tibble(
+    label = params$candidate_name,
+    rows = nrow(df_candidate),
+    locations = n_distinct(df_candidate$geo_value),
+    first_date = min(df_candidate$time_value, na.rm = TRUE),
+    last_date = max(df_candidate$time_value, na.rm = TRUE)
+)
+
+p_span <- ggplot(reference_source_plot, aes(y = reorder(reference_label, first_date))) +
+    geom_linerange(aes(xmin = first_date, xmax = last_date), linewidth = 1.8, color = dis_pal_list[2], na.rm = TRUE) +
+    geom_point(aes(x = first_date), size = 2.3, color = "#172431", na.rm = TRUE) +
+    geom_point(aes(x = last_date), size = 2.3, color = "#172431", na.rm = TRUE) +
+    geom_vline(xintercept = as.Date(params$start_day), linetype = "dashed", color = "gray60") +
+    geom_vline(xintercept = as.Date(params$end_day), linetype = "dashed", color = "gray60") +
+    scale_x_date(labels = label_date_short(), breaks = breaks_pretty(n = 4)) +
+    labs(
+        title = "Loaded date span",
+        x = "Date",
+        y = NULL
+    ) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10, lineheight = 0.9)
+    )
+
+overlap_long <- reference_source_plot %>%
+    transmute(
+        reference_label,
+        `Rows loaded` = rows,
+        `Locations loaded` = locations,
+        `Overlap rows` = intersected_rows,
+        `Overlap locations` = intersected_locations,
+        `Overlap dates` = intersected_dates,
+        `Overlap percent` = intersection_pct / 100
+    ) %>%
+    pivot_longer(
+        cols = -reference_label,
+        names_to = "overlap_metric",
+        values_to = "value"
+    ) %>%
+    mutate(
+        display_value = case_when(
+            overlap_metric == "Overlap percent" ~ label_percent(accuracy = 0.1)(value),
+            TRUE ~ label_comma()(value)
+        ),
+        overlap_metric = factor(overlap_metric, levels = c("Rows loaded", "Locations loaded", "Overlap rows", "Overlap locations", "Overlap dates", "Overlap percent"))
+    )
+
+p_overlap <- ggplot(overlap_long, aes(x = overlap_metric, y = reference_label)) +
+    geom_tile(fill = "white", color = "gray80", linewidth = 0.35) +
+    geom_text(aes(label = display_value), size = 3.2, color = "gray15") +
+    labs(
+        title = "Loaded data volume and candidate/reference overlap",
+        x = NULL,
+        y = NULL
+    ) +
+    theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, lineheight = 0.95),
+        axis.text.y = element_text(size = 10, lineheight = 0.9)
+    )
+
+p_span / p_overlap + plot_layout(heights = c(1, 1.35))
+```
 
 ### Time Series Overview
 
-This plot compares the candidate and references on a common scale. For each indicator and location, values are standardized as
+Each indicator is standardized within location; the plot shows the median standardized value across locations at each date.
+
+For each indicator and location, values are standardized as
 
 $$
 Z_{g,t}=\frac{X_{g,t}-\bar{X}_g}{s_g},
 $$
 
-where $X_{g,t}$ is the raw value at location $g$ and time $t$, $\bar{X}_g$ is that location's mean, and $s_g$ is that location's standard deviation. The plotted line is the median standardized value across locations at each date.
+where $X_{g,t}$ is the raw value, $\bar{X}_g$ is the location mean, and $s_g$ is the location standard deviation.
 
 ```{r}
 #| label: normalized-series
@@ -718,17 +984,16 @@ ggplot(trend_long, aes(x = time_value, y = median_norm, color = indicator_label)
     scale_color_manual(values = trend_cols, labels = wrap_legend_label) +
     labs(
         title = "Median normalized trend across locations",
-        subtitle = "Candidate and all references on a common standardized scale",
         x = "Date", y = "Median normalized value", color = "Indicator"
     ) +
-    guides(color = guide_legend(ncol = 1, byrow = TRUE, override.aes = list(linewidth = 1.4))) +
+    guides(color = reference_guide(override.aes = list(linewidth = 1.4))) +
     safe_bottom_legend(text_size = 10) +
     theme(axis.text.x = element_text(angle = 35, hjust = 1))
 ```
 
 ### Quantile Trends
 
-This plot displays the cross-location distribution of the candidate and each reference over time. For each candidate/reference pair, the candidate quantiles are recomputed on that pair's overlap so that the comparison uses the same locations and dates as the later pairwise correlations.
+This plot shows cross-location quantiles after within-location standardization. Candidate quantiles are recomputed on each candidate/reference overlap.
 
 ```{r}
 #| label: eda-quantiles
@@ -744,30 +1009,40 @@ df_quantiles_multi <- df_inter %>%
         indicator_role = recode(indicator_role, candidate = "Candidate", reference = "Reference"),
         indicator_label = if_else(indicator_role == "Candidate", params$candidate_name, reference_name)
     ) %>%
+    group_by(reference_id, reference_label, indicator_role, indicator_label, geo_value) %>%
+    mutate(value_norm = zscore_safe(value)) %>%
+    ungroup() %>%
     group_by(reference_label, indicator_role, indicator_label, time_value) %>%
     summarize(
-        q05 = quantile(value, 0.05, na.rm = TRUE),
-        q25 = quantile(value, 0.25, na.rm = TRUE),
-        q50 = quantile(value, 0.50, na.rm = TRUE),
-        q75 = quantile(value, 0.75, na.rm = TRUE),
-        q95 = quantile(value, 0.95, na.rm = TRUE),
-        locations = sum(!is.na(value)),
+        q05 = quantile(value_norm, 0.05, na.rm = TRUE),
+        q25 = quantile(value_norm, 0.25, na.rm = TRUE),
+        q50 = quantile(value_norm, 0.50, na.rm = TRUE),
+        q75 = quantile(value_norm, 0.75, na.rm = TRUE),
+        q95 = quantile(value_norm, 0.95, na.rm = TRUE),
+        locations = sum(!is.na(value_norm)),
         .groups = "drop"
     ) %>%
     filter(is.finite(q50))
 
+norm_y_lim <- quantile(abs(c(df_quantiles_multi$q05, df_quantiles_multi$q95)), 0.98, na.rm = TRUE)
+norm_y_lim <- if_else(is.finite(norm_y_lim), max(2, min(5, ceiling(norm_y_lim))), 3)
+role_cols <- c(Candidate = dis_pal_list[2], Reference = dis_pal_list[3])
+
 ggplot(df_quantiles_multi, aes(x = time_value)) +
-    geom_ribbon(aes(ymin = q05, ymax = q95), fill = dis_pal_list[2], alpha = 0.12) +
-    geom_ribbon(aes(ymin = q25, ymax = q75), fill = dis_pal_list[2], alpha = 0.28) +
-    geom_line(aes(y = q50), color = dis_pal_list[2], linewidth = 0.75) +
-    facet_grid(reference_label ~ indicator_role, scales = "free_y") +
+    geom_ribbon(aes(ymin = q05, ymax = q95, fill = indicator_role), alpha = 0.12) +
+    geom_ribbon(aes(ymin = q25, ymax = q75, fill = indicator_role), alpha = 0.28) +
+    geom_line(aes(y = q50, color = indicator_role), linewidth = 0.75) +
+    facet_grid(reference_label ~ indicator_role) +
     scale_x_date(breaks = breaks_pretty(n = 5), labels = label_date_short()) +
-    scale_y_continuous(labels = label_comma(), breaks = breaks_pretty(n = 4)) +
+    scale_y_continuous(breaks = breaks_pretty(n = 5)) +
+    coord_cartesian(ylim = c(-norm_y_lim, norm_y_lim)) +
+    scale_color_manual(values = role_cols) +
+    scale_fill_manual(values = role_cols) +
     labs(
-        title = "Quantile trends by candidate/reference comparison",
-        subtitle = "Line is median across locations; ribbons show 25th-75th and 5th-95th percentiles",
-        x = "Date", y = "Value"
+        title = "Normalized quantile trends by candidate/reference comparison",
+        x = "Date", y = "Within-location standardized value"
     ) +
+    guides(color = "none", fill = "none") +
     theme(
         axis.text.x = element_text(angle = 35, hjust = 1),
         strip.text = element_text(size = 11, face = "bold")
@@ -776,7 +1051,7 @@ ggplot(df_quantiles_multi, aes(x = time_value)) +
 
 ### Coverage and Missingness
 
-This plot shows how many locations are available for the candidate, for each reference, and for their pairwise overlap at each date. The "Both" line is the effective sample size used for date-specific spatial correlations.
+This plot shows candidate, reference, and pairwise-overlap location counts by date. "Both" is the sample size for date-specific spatial correlations.
 
 ```{r}
 #| label: coverage-over-time
@@ -811,14 +1086,14 @@ ggplot(coverage, aes(x = time_value, y = locations, color = availability)) +
     scale_color_manual(values = c(Candidate = dis_pal_list[2], Reference = dis_pal_list[1], Both = dis_pal_list[4])) +
     labs(
         title = "Data availability over time",
-        x = "Date", y = "Locations", color = ""
+        x = "Date", y = "Number of locations", color = ""
     ) +
     theme(legend.position = "bottom")
 ```
 
 ### Summary Statistics and Missingness
 
-This section summarizes availability and basic values by location for each candidate/reference pair.
+This section summarizes values and missingness by location. Pair missingness is the fraction of periods where either value is missing.
 
 ```{r}
 #| label: eda-summary-missingness
@@ -871,7 +1146,6 @@ ggplot(missingness_long, aes(x = metric, y = reference_label, fill = missing_pct
     scale_fill_gradient(low = "white", high = dis_pal_list[3], limits = c(0, 100), labels = label_percent(scale = 1)) +
     labs(
         title = "Median missingness by reference comparison",
-        subtitle = "Pair missingness is the fraction of periods where either candidate or reference is missing",
         x = NULL, y = "Reference indicator", fill = "Median missing"
     ) +
     theme(axis.text.y = element_text(size = 11), legend.position = "right")
@@ -895,7 +1169,7 @@ summary_table <- location_summary %>%
         `Either missing` = sprintf("%.1f%%", pair_missing_pct)
     )
 
-DT::datatable(
+nowrap_datatable(
     summary_table,
     caption = "Summary statistics by location and reference comparison.",
     rownames = FALSE,
@@ -906,7 +1180,7 @@ DT::datatable(
 
 ### Noise Assessment
 
-Coefficient of variation (CV) is `sd(value) / abs(mean(value))` within each location. Lower CV means less variation relative to the location-specific mean.
+Coefficient of variation (CV) is `sd(value) / abs(mean(value))` within location. Negative CV difference, or points below the diagonal, means the candidate has lower relative variation than the reference.
 
 ```{r}
 #| label: eda-noise
@@ -944,7 +1218,7 @@ noise_summary <- noise_stats %>%
         across(where(is.numeric), ~ if_else(is.nan(.x), NA_real_, .x))
     )
 
-DT::datatable(
+nowrap_datatable(
     noise_summary,
     caption = "Comparative CV summary. Negative median CV difference means the candidate is typically smoother than that reference.",
     rownames = FALSE,
@@ -956,20 +1230,19 @@ DT::datatable(
 ```{r}
 #| label: eda-noise-plot
 #| echo: false
-#| fig-height: 8.6
-p_cv_diff <- ggplot(noise_stats_plot, aes(x = reference_label, y = cv_diff, fill = reference_label)) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+#| fig-height: 10.2
+p_cv_diff <- ggplot(noise_stats_plot, aes(x = cv_diff, y = reference_label, fill = reference_label)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
     geom_violin(alpha = 0.35, color = NA, trim = TRUE) +
-    geom_boxplot(width = 0.18, outlier.alpha = 0.25, color = "gray25") +
-    coord_flip() +
+    geom_boxplot(width = 0.18, outlier.alpha = 0.25, color = "gray25", orientation = "y") +
     scale_fill_manual(values = ref_cols) +
-    scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
+    scale_x_continuous(labels = label_percent(), breaks = breaks_pretty()) +
     guides(fill = "none") +
     labs(
         title = "Candidate/reference CV difference by location",
-        subtitle = "Negative values mean the candidate is smoother than the reference",
-        x = NULL, y = "Candidate CV - reference CV"
-    )
+        x = "Candidate CV - reference CV", y = "Reference indicator"
+    ) +
+    theme(axis.text.y = element_text(size = 11, lineheight = 0.9))
 
 p_cv_pair <- ggplot(noise_stats_plot, aes(x = reference_cv, y = candidate_cv, color = reference_label)) +
     geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
@@ -979,35 +1252,34 @@ p_cv_pair <- ggplot(noise_stats_plot, aes(x = reference_cv, y = candidate_cv, co
     scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
     labs(
         title = "Paired CV comparison",
-        subtitle = "Points below the dashed line indicate locations where the candidate is smoother",
         x = "Reference CV", y = "Candidate CV", color = "Reference indicator"
     ) +
     safe_bottom_legend(text_size = 10) +
-    guides(color = guide_legend(ncol = 1, byrow = TRUE, override.aes = list(size = 3, alpha = 1)))
+    guides(color = reference_guide(override.aes = list(size = 3, alpha = 1)))
 
 p_cv_diff / p_cv_pair + plot_layout(heights = c(1, 1.2))
 ```
 
 ## Correlation Analysis {#correlation}
 
-All correlation metrics are computed on candidate/reference intersections: rows where both the candidate and the given reference are non-missing. The report repeats the original one-to-one correlation diagnostics for each reference indicator in parallel.
+All correlations use rows where both candidate and reference are observed. Spearman correlation ranges from -1 to 1: similar rankings, little monotone association, and opposite rankings respectively.
 
-### Correlation over Time
+### Correlation Over Locations
 
-This section asks whether the candidate ranks locations similarly to each reference at each date. Here, $g$ indexes locations, $t$ indexes time, $k$ indexes reference indicators, $C_{g,t}$ is the candidate value, and $R^{(k)}_{g,t}$ is reference $k$.
+Let $C_{g,t}$ be the candidate value and $R^{(k)}_{g,t}$ be reference $k$ at location $g$ and time $t$. $\operatorname{cor}_S(x,y)$ is Spearman correlation after dropping missing pairs.
 
-$\operatorname{cor}_S(x,y)$ is Spearman rank correlation after dropping missing pairs. In this report, "agreement" means numeric association, not causality or ground truth.
-
-For each individual reference $k$ and time $t$, the pairwise spatial correlation is computed across locations:
+For each reference indicator $k$ and date $t$, the pairwise spatial correlation is computed across locations:
 
 $$
-\rho^{(k)}_{\text{space},t}
+s^{(k)}_{\text{space},t}
 = \operatorname{cor}_S
 \left(
   \{C_{g,t}\}_{g},
   \{R^{(k)}_{g,t}\}_{g}
 \right).
 $$
+
+Faint lines are date-specific correlations; thick lines are LOESS trends.
 
 ```{r}
 #| label: cor-geographic-over-time
@@ -1026,28 +1298,52 @@ ggplot(cor_by_time, aes(x = time_value, y = cor, color = reference_label)) +
     scale_fill_manual(values = ref_cols, labels = wrap_legend_label) +
     labs(
         title = "Pairwise geographic rank correlation over time",
-        subtitle = "Faint lines show date-specific correlations; thicker smooth lines show LOESS trends for each reference",
-        x = "Date", y = "Spearman ρ across locations",
+        x = "Date", y = "Spearman correlation across locations",
         color = "Reference indicator", fill = "Reference indicator"
     ) +
     guides(
-        color = guide_legend(ncol = 1, byrow = TRUE, override.aes = list(linewidth = 1.5, alpha = 1)),
+        color = reference_guide(override.aes = list(linewidth = 1.5, alpha = 1)),
         fill = "none"
     ) +
     safe_bottom_legend(text_size = 10) +
     theme(axis.text.x = element_text(angle = 35, hjust = 1))
 ```
 
+#### Dates With Minimum Spatial Agreement
+
+Dates with minimum spatial correlation for each candidate/reference pair.
+
+```{r}
+#| label: minimum-spatial-dates
+#| echo: false
+#| results: asis
+weak_spatial_tbl <- weak_spatial_dates %>%
+    transmute(
+        Reference = reference_name,
+        Date = time_value,
+        `Locations compared` = n_locations,
+        `Spatial Spearman correlation` = cor
+    )
+
+nowrap_datatable(
+    weak_spatial_tbl,
+    caption = "Dates with minimum spatial agreement for each candidate/reference pair.",
+    rownames = FALSE,
+    options = list(scrollX = TRUE, pageLength = 10)
+) %>%
+    DT::formatRound(columns = "Spatial Spearman correlation", digits = 3)
+```
+
 ---
 
-### Distribution of Temporal Correlations
+### Correlation Over Time Within Locations
 
-This section asks whether the candidate and references move together over time within each location at zero lag. Each correlation is computed across dates while holding one location fixed, then the distribution across locations is shown for each reference.
+Each correlation is computed across dates within one location at zero lag. Histograms show the location-level distributions; dashed lines mark reference-specific medians.
 
-For each individual reference $k$ and location $g$, the pairwise temporal correlation is:
+For each reference indicator $k$ and location $g$, the pairwise temporal correlation is:
 
 $$
-\rho^{(k)}_{\text{time},g}
+s^{(k)}_{\text{time},g}
 = \operatorname{cor}_S
 \left(
   \{C_{g,t}\}_{t},
@@ -1072,22 +1368,21 @@ ggplot(cor_by_geo %>% filter(is.finite(cor)), aes(x = cor, fill = reference_labe
         color = "gray20",
         linewidth = 0.8
     ) +
-    facet_wrap(~reference_label, ncol = 1) +
+    facet_wrap(~reference_name, ncol = 1) +
     scale_x_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
     scale_fill_manual(values = ref_cols) +
     guides(fill = "none") +
     labs(
         title = "Distribution of intra-location temporal correlations",
-        subtitle = "Each histogram shows zero-lag Spearman correlations across locations; dashed line is the reference-specific median",
-        x = expression(Spearman ~ rho),
-        y = "Locations"
+        x = "Spearman correlation",
+        y = "Number of locations"
     ) +
     theme(strip.text = element_text(size = 12, face = "bold"))
 ```
 
 ### Lagged Correlations
 
-This section scans candidate lead/lag values. The lag $\ell$ is measured in `r time_unit`. Positive lag means earlier candidate values are compared with current reference values, so the candidate leads the reference. Negative lag shifts the candidate later.
+Lag $\ell$ is measured in `r time_unit`. Positive lag compares earlier candidate values with current reference values; negative lag shifts the candidate later.
 
 For lag $\ell$, the shifted candidate is compared with the reference:
 
@@ -1119,8 +1414,7 @@ if (nrow(cor_lagged_geo_selected) == 0) {
         scale_fill_manual(values = lag_palette(length(lag_values))) +
         labs(
             title = "Pairwise per-location temporal correlation distributions at selected lags",
-            subtitle = "Each curve summarizes location-level temporal Spearman ρ for one candidate lag; positive lag means candidate leads reference",
-            x = "Per-location temporal Spearman ρ",
+            x = "Per-location temporal Spearman correlation",
             y = "Density",
             color = lag_unit_label,
             fill = lag_unit_label
@@ -1136,7 +1430,7 @@ if (nrow(cor_lagged_geo_selected) == 0) {
 
 #### Empirical Uncertainty
 
-These intervals summarize variation in the pairwise correlation distributions. Spatial intervals vary across dates; temporal intervals vary across locations. They are empirical summaries, not model-based confidence intervals.
+Intervals summarize empirical variation: spatial across dates, temporal across locations. Thick intervals are 25th-75th percentiles; thin intervals are 10th-90th percentiles.
 
 ```{r}
 #| label: empirical-uncertainty
@@ -1146,7 +1440,7 @@ uncertainty_tbl <- bind_rows(
     mean_geo_cor %>%
         transmute(
             reference_id, reference_name, reference_label,
-            metric = "Spatial ρ across dates",
+            metric = "Spatial correlation across dates",
             median = median_cor,
             p10 = p10_cor,
             p25 = p25_cor,
@@ -1157,7 +1451,7 @@ uncertainty_tbl <- bind_rows(
     temporal_summary %>%
         transmute(
             reference_id, reference_name, reference_label,
-            metric = "Temporal ρ across locations",
+            metric = "Temporal correlation across locations",
             median = median_cor,
             p10 = p10_cor,
             p25 = p25_cor,
@@ -1167,7 +1461,7 @@ uncertainty_tbl <- bind_rows(
         )
 ) %>%
     filter(is.finite(median)) %>%
-    mutate(metric = factor(metric, levels = c("Spatial ρ across dates", "Temporal ρ across locations")))
+    mutate(metric = factor(metric, levels = c("Spatial correlation across dates", "Temporal correlation across locations")))
 
 ggplot(uncertainty_tbl, aes(y = reference_label, x = median, color = reference_label)) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "gray65") +
@@ -1180,9 +1474,32 @@ ggplot(uncertainty_tbl, aes(y = reference_label, x = median, color = reference_l
     guides(color = "none") +
     labs(
         title = "Empirical uncertainty in pairwise agreement metrics",
-        subtitle = "Thick intervals show 25th-75th percentiles; thin intervals show 10th-90th percentiles",
-        x = "Spearman ρ", y = "Reference indicator"
+        x = "Spearman correlation", y = "Reference indicator"
     ) +
+    theme(axis.text.y = element_text(size = 11))
+```
+
+#### Agreement Consistency Across References
+
+Let $m^{(k)}_q$ be metric $q$ for reference $k$. Each point is one pairwise metric; references are not averaged.
+
+```{r}
+#| label: agreement-consistency
+#| echo: false
+#| fig-height: 5.8
+ggplot(agreement_consistency, aes(x = value, y = reference_label, color = metric)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray65") +
+    geom_point(size = 3, position = position_dodge(width = 0.55)) +
+    scale_x_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
+    scale_color_manual(values = setNames(dis_pal_list[seq_len(n_distinct(agreement_consistency$metric))], levels(agreement_consistency$metric))) +
+    labs(
+        title = "Agreement consistency across references",
+        x = "Spearman correlation",
+        y = "Reference indicator",
+        color = "Metric"
+    ) +
+    guides(color = guide_legend(ncol = 1, title.position = "top", title.hjust = 0.5)) +
+    safe_bottom_legend(text_size = 10) +
     theme(axis.text.y = element_text(size = 11))
 ```
 
@@ -1190,7 +1507,7 @@ ggplot(uncertainty_tbl, aes(y = reference_label, x = median, color = reference_l
 
 #### Systematic Lag Analysis
 
-The pairwise lag response curve summarizes within-location temporal correlations by reference and lag. The marked lag is the value with the largest mean temporal correlation across locations for that reference.
+Lag response curves show median within-location correlation by lag; ribbons show the 25th-75th percentile range. Matrix cells show mean correlation; white dots mark optimal lags.
 
 ```{r}
 #| label: lag-response-curve
@@ -1213,12 +1530,11 @@ ggplot(lag_summary, aes(x = lag, y = median_cor, color = reference_label, fill =
     scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
     labs(
         title = "Pairwise lag response curves",
-        subtitle = "Line is median within-location ρ; ribbon is 25th-75th percentile across locations",
-        x = lag_unit_label, y = "Spearman ρ over time",
+        x = lag_unit_label, y = "Spearman correlation over time",
         color = "Reference indicator", fill = "Reference indicator"
     ) +
     guides(
-        color = guide_legend(ncol = 1, byrow = TRUE, override.aes = list(linewidth = 1.5)),
+        color = reference_guide(override.aes = list(linewidth = 1.5)),
         fill = "none"
     ) +
     safe_bottom_legend(text_size = 10)
@@ -1249,8 +1565,7 @@ ggplot(lag_summary, aes(x = lag, y = reference_label, fill = mean_cor)) +
     ) +
     labs(
         title = "Pairwise lagged temporal agreement matrix",
-        subtitle = "Cell color is mean within-location Spearman ρ; white dot marks each reference's best lag",
-        x = lag_unit_label, y = "Reference indicator", fill = "Mean ρ"
+        x = lag_unit_label, y = "Reference indicator", fill = "Mean correlation"
     ) +
     theme(
         legend.position = "right",
@@ -1258,25 +1573,54 @@ ggplot(lag_summary, aes(x = lag, y = reference_label, fill = mean_cor)) +
     )
 ```
 
+#### Lag Concordance Across References
+
+For each reference indicator $k$, the optimal lag is
+
+$$
+\ell_k^*=\arg\max_{\ell}\ \overline{s}^{(k)}_{\text{time},\ell},
+$$
+
+where $\overline{s}^{(k)}_{\text{time},\ell}$ is the mean within-location temporal Spearman correlation at lag $\ell$. Each point is one reference-specific optimal lag.
+
+```{r}
+#| label: lag-concordance
+#| echo: false
+#| fig-height: 5.6
+ggplot(lag_concordance, aes(x = optimal_lag, y = reference_label, color = lead_direction)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray65") +
+    geom_point(size = 3.4) +
+    scale_x_continuous(breaks = breaks_pretty()) +
+    scale_color_manual(values = c(
+        "Candidate leads" = dis_pal_list[2],
+        "Synchronous" = "#172431",
+        "Candidate lags" = dis_pal_list[3],
+        "No estimate" = "gray65"
+    )) +
+    labs(
+        title = "Optimal lag concordance across references",
+        x = lag_unit_label,
+        y = "Reference indicator",
+        color = "Direction"
+    ) +
+    guides(color = guide_legend(ncol = 1, title.position = "top", title.hjust = 0.5)) +
+    safe_bottom_legend(text_size = 10) +
+    theme(axis.text.y = element_text(size = 11))
+```
+
 #### Correlation over time, at different `r time_unit`
 
-This view computes correlation across locations at each date after shifting the candidate. It shows whether selected lags remain stable over calendar time, rather than only improving the location-level temporal distribution.
+Correlations are computed across locations at each date after shifting the candidate. Color identifies reference; line type identifies lag.
 
 ```{r}
 #| label: lagged-geographic-time
 #| echo: false
 #| fig-height: 9.4
-cor_lagged_time <- df_lagged %>%
+cor_lagged_time_selected <- cor_lagged_time %>%
     filter(lag %in% lag_values) %>%
-    group_by(reference_id, reference_name, reference_label, lag, time_value) %>%
-    summarize(
-        n_locations = n_distinct(geo_value),
-        cor = safe_spearman(candidate, reference),
-        .groups = "drop"
-    ) %>%
     mutate(lag = factor(lag, levels = lag_values))
 
-ggplot(cor_lagged_time, aes(x = time_value, y = cor, color = reference_label, linetype = lag)) +
+ggplot(cor_lagged_time_selected, aes(x = time_value, y = cor, color = reference_label, linetype = lag)) +
     geom_line(alpha = 0.3, linewidth = 0.45) +
     geom_smooth(aes(group = interaction(reference_label, lag)), method = "loess", span = 0.2, se = FALSE, linewidth = 0.8) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
@@ -1285,12 +1629,11 @@ ggplot(cor_lagged_time, aes(x = time_value, y = cor, color = reference_label, li
     scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
     labs(
         title = sprintf("Pairwise geographic correlation over time at selected %s", time_unit),
-        subtitle = "Color compares reference indicators; line type compares candidate lead/lag",
-        x = "Date", y = "Spearman ρ across locations",
+        x = "Date", y = "Spearman correlation across locations",
         color = "Reference indicator", linetype = lag_unit_label
     ) +
     guides(
-        color = guide_legend(ncol = 1, byrow = TRUE, override.aes = list(linewidth = 1.5, alpha = 1)),
+        color = reference_guide(override.aes = list(linewidth = 1.5, alpha = 1)),
         linetype = guide_legend(nrow = 1, byrow = TRUE)
     ) +
     safe_bottom_legend(text_size = 10) +
@@ -1299,9 +1642,9 @@ ggplot(cor_lagged_time, aes(x = time_value, y = cor, color = reference_label, li
 
 ---
 
-### Choropleth Map at Optimal Lag
+### Geographic Heterogeneity at Optimal Lag
 
-These maps and tables show where temporal agreement is stronger or weaker. For each reference, the map uses that reference's optimal lag from the lead-lag scan above, defined as the lag with the largest mean within-location temporal Spearman correlation across locations.
+Maps and tables show location-level temporal agreement at the reference-specific optimal lag.
 
 ```{r}
 #| label: cor-choropleth
@@ -1366,22 +1709,97 @@ cor_top <- cor_optimal_multi %>%
         `Geo value` = geo_value,
         `Geo name` = geo_name,
         `Optimal lag` = optimal_lag,
-        `Spearman ρ` = cor,
+        `Spearman correlation` = cor,
         Rank = rank_within_reference
     )
 
-DT::datatable(
+nowrap_datatable(
     cor_top,
     caption = "Location-level temporal correlation at each pairwise reference's optimal lag.",
     rownames = FALSE,
     options = list(scrollX = TRUE, scrollY = "420px", scrollCollapse = TRUE, pageLength = 15)
 ) %>%
-    DT::formatRound(columns = "Spearman ρ", digits = 3)
+    DT::formatRound(columns = "Spearman correlation", digits = 3)
+```
+
+#### Locations With Minimum Temporal Agreement
+
+Locations with minimum temporal correlation at each reference-specific optimal lag $\ell_k^*$.
+
+```{r}
+#| label: minimum-temporal-locations
+#| echo: false
+#| results: asis
+weak_location_tbl <- weak_temporal_locations %>%
+    transmute(
+        Reference = reference_name,
+        `Geo value` = geo_value,
+        `Geo name` = geo_name,
+        `Optimal lag` = optimal_lag,
+        `Temporal Spearman correlation` = cor
+    )
+
+nowrap_datatable(
+    weak_location_tbl,
+    caption = "Locations with minimum temporal agreement for each candidate/reference pair at the reference-specific optimal lag.",
+    rownames = FALSE,
+    options = list(scrollX = TRUE, pageLength = 10)
+) %>%
+    DT::formatRound(columns = "Temporal Spearman correlation", digits = 3)
+```
+
+### Reference Agreement Check
+
+Context check: agreement among the selected reference indicators.
+
+For references $j$ and $k$, date-specific spatial agreement is
+
+$$
+s^{(j,k)}_{\text{ref},t}
+= \operatorname{cor}_S
+\left(
+  \{R^{(j)}_{g,t}\}_{g},
+  \{R^{(k)}_{g,t}\}_{g}
+\right).
+$$
+
+The heatmap shows the mean of $s^{(j,k)}_{\text{ref},t}$ across dates.
+
+```{r}
+#| label: reference-agreement-matrix
+#| echo: false
+#| fig-height: 6.8
+if (nrow(reference_agreement_matrix) == 0) {
+    cat("Reference agreement matrix is only available when at least two reference indicators are provided.\n\n")
+} else {
+    ggplot(reference_agreement_matrix, aes(x = col_reference, y = row_reference, fill = mean_cor)) +
+        geom_tile(color = "white", linewidth = 0.35) +
+        geom_text(aes(label = if_else(is.na(mean_cor), "NA", sprintf("%.2f", mean_cor))), size = 3.4, color = "gray15") +
+        scale_y_discrete(labels = \(x) wrap_reference(x, width = 28)) +
+        scale_fill_gradient2(
+            low = dis_pal_list[3],
+            mid = "white",
+            high = dis_pal_list[2],
+            midpoint = 0,
+            limits = c(-1, 1),
+            na.value = "gray90"
+        ) +
+        labs(
+            title = "Reference agreement matrix",
+            x = "Reference indicator",
+            y = "Reference indicator",
+            fill = "Mean correlation"
+        ) +
+        theme(
+            axis.text.y = element_text(lineheight = 0.9)
+        ) +
+        vertical_indicator_axis(text_size = 10)
+}
 ```
 
 ## Summary {#summary}
 
-This final table collects the main pairwise metrics for quick review. It intentionally does not combine references or produce an automated decision; it reports the same quantities for each candidate/reference pair so reviewers can compare patterns across references.
+Main pairwise metrics. References are not combined.
 
 ```{r}
 #| label: screening-summary
@@ -1400,20 +1818,20 @@ screening_tbl <- mean_geo_cor %>%
     right_join(reference_specs %>% select(reference_id, reference_name), by = c("reference_id", "reference_name")) %>%
     transmute(
         Reference = reference_name,
-        `Mean geographic ρ` = if_else(is.na(mean_cor_geographic), "No overlap", sprintf("%.3f", mean_cor_geographic)),
-        `Median geographic ρ` = if_else(is.na(median_cor_geographic), "No overlap", sprintf("%.3f", median_cor_geographic)),
-        `Mean temporal ρ` = if_else(is.na(mean_cor_temporal), "No overlap", sprintf("%.3f", mean_cor_temporal)),
-        `Median temporal ρ` = if_else(is.na(median_cor_temporal), "No overlap", sprintf("%.3f", median_cor_temporal)),
-        `% locations |ρ| > 0.5` = if_else(is.na(pct_abs_gt_05), "No overlap", sprintf("%.0f%%", pct_abs_gt_05)),
+        `Mean geographic correlation` = if_else(is.na(mean_cor_geographic), "No overlap", sprintf("%.3f", mean_cor_geographic)),
+        `Median geographic correlation` = if_else(is.na(median_cor_geographic), "No overlap", sprintf("%.3f", median_cor_geographic)),
+        `Mean temporal correlation` = if_else(is.na(mean_cor_temporal), "No overlap", sprintf("%.3f", mean_cor_temporal)),
+        `Median temporal correlation` = if_else(is.na(median_cor_temporal), "No overlap", sprintf("%.3f", median_cor_temporal)),
+        `% locations |correlation| > 0.5` = if_else(is.na(pct_abs_gt_05), "No overlap", sprintf("%.0f%%", pct_abs_gt_05)),
         `Optimal lag` = if_else(is.na(optimal_lag), "No overlap", as.character(optimal_lag)),
-        `Mean ρ at optimal lag` = if_else(is.na(mean_cor_at_optimal_lag), "No overlap", sprintf("%.3f", mean_cor_at_optimal_lag)),
-        `Median ρ at optimal lag` = if_else(is.na(median_cor_at_optimal_lag), "No overlap", sprintf("%.3f", median_cor_at_optimal_lag))
+        `Mean correlation at optimal lag` = if_else(is.na(mean_cor_at_optimal_lag), "No overlap", sprintf("%.3f", mean_cor_at_optimal_lag)),
+        `Median correlation at optimal lag` = if_else(is.na(median_cor_at_optimal_lag), "No overlap", sprintf("%.3f", median_cor_at_optimal_lag))
     ) %>%
-    arrange(desc(suppressWarnings(as.numeric(`Mean ρ at optimal lag`))))
+    arrange(desc(suppressWarnings(as.numeric(`Mean correlation at optimal lag`))))
 
-DT::datatable(
+nowrap_datatable(
     screening_tbl,
-    caption = "Multi-reference screening metrics",
+    caption = "Multi-reference pairwise metrics",
     rownames = FALSE,
     options = list(scrollX = TRUE, pageLength = 10)
 )
