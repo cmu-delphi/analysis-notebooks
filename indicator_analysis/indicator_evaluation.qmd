@@ -331,7 +331,7 @@ order_strata <- function(x) {
 # Helper: order stratum columns and append the number of locations reporting
 # each level to its label. Panels drawn from different location sets are not
 # directly comparable, so the label has to say how many locations each one has.
-label_strata_coverage <- function(df, keys, src) {
+label_strata_coverage <- function(df, keys, src = df_candidate) {
     src <- as_tibble(src) %>% filter(!is.na(value))
     for (k in keys) {
         f <- order_strata(df[[k]])
@@ -353,8 +353,7 @@ label_strata_coverage <- function(df, keys, src) {
 # by the line, markers show which periods actually carry a value, and the
 # confidence band (when the data has one) gets its own legend entry so it can be
 # switched off.
-plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
-                                 y_title = "Value", group_prefix = "Location: ") {
+plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
     groups <- as.character(sort(unique(df$geo_value)))
     strata <- if (is.null(trace_col)) NA_character_ else levels(order_strata(df[[trace_col]]))
     pal <- setNames(rep_len(dis_pal_list, length(strata)), strata)
@@ -367,7 +366,7 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
             if (!is.na(s)) d <- d %>% filter(.data[[trace_col]] == s)
             d <- d %>% arrange(time_value)
             if (nrow(d) == 0 || all(is.na(d$value))) next
-            lab <- if (is.na(s)) y_title else s
+            lab <- if (is.na(s)) "Value" else s
             col <- unname(if (is.na(s)) dis_pal_list[1] else pal[[s]])
             if (!is.null(ci_cols) && any(!is.na(d[[ci_cols[1]]]))) {
                 specs <- append(specs, list(list(
@@ -408,7 +407,7 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
                 name = sp$lab, legendgroup = sp$lab,
                 showlegend = active[i] && legend_ok[i], visible = active[i],
                 hovertemplate = paste0(
-                    "%{x|%Y-%m-%d}<br>", y_title, ": %{y:.3f}",
+                    "%{x|%Y-%m-%d}<br>Value: %{y:.3f}",
                     "<extra>", sp$lab, "</extra>"
                 )
             )
@@ -421,7 +420,7 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
             method = "update",
             args = list(
                 list(visible = as.list(on), showlegend = as.list(on & legend_ok)),
-                list(title = list(text = paste0(group_prefix, g)))
+                list(title = list(text = paste0("Location: ", g)))
             ),
             label = g
         )
@@ -429,9 +428,9 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
 
     p %>%
         plotly::layout(
-            title = list(text = paste0(group_prefix, groups[1])),
+            title = list(text = paste0("Location: ", groups[1])),
             xaxis = list(title = "Date"),
-            yaxis = list(title = y_title, fixedrange = TRUE),
+            yaxis = list(title = "Value", fixedrange = TRUE),
             legend = list(title = list(text = trace_col %||% "")),
             updatemenus = list(list(
                 type = "dropdown", active = 0, buttons = buttons, x = 0.05, y = 1.15
@@ -777,7 +776,7 @@ coverage <- df_candidate %>%
     as_epi_df(signal_format = "as_is", other_keys = c("signal", params$extra_keys)) %>%
     as_tibble() %>%
     mutate(indicator = signal_labels[signal]) %>%
-    label_strata_coverage(params$extra_keys, src = df_candidate)
+    label_strata_coverage(params$extra_keys)
 
 # The full (period x stratum) x location grid, with an NA value wherever a
 # location has no row. Every missingness figure below is derived from this, so
@@ -999,9 +998,10 @@ overview_plots <- map(signals_vec, function(sig) {
     d <- df_sample %>% filter(signal == sig)
     p <- plot_series_dropdown(
         d,
+        # ponytail: one trace per level of the first stratifier only; nest the
+        # rest into a combined key here if a second stratifier ever needs panels.
         trace_col = if (length(params$extra_keys) > 0) params$extra_keys[1] else NULL,
-        ci_cols = ci_cols,
-        y_title = "Value"
+        ci_cols = ci_cols
     )
     if (is.null(p)) return(NULL)
     p <- p %>% plotly::toWebGL() %>% plotly::partial_bundle()
@@ -1064,7 +1064,7 @@ df_quantiles_wide <- df_quantiles_wide %>%
     ungroup() %>%
     as_tibble() %>%
     mutate(indicator = signal_labels[signal]) %>%
-    label_strata_coverage(params$extra_keys, src = df_candidate)
+    label_strata_coverage(params$extra_keys)
 
 ggplot(df_quantiles_wide, aes(x = time_value)) +
     geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
@@ -1206,7 +1206,7 @@ cv_upper <- quantile(noise_stats$cand_cv, 0.99, na.rm = TRUE)
 noise_stats_plot <- noise_stats %>%
     filter(cand_cv <= cv_upper) %>%
     mutate(signal_label = signal_labels[signal]) %>%
-    label_strata_coverage(params$extra_keys, src = df_candidate)
+    label_strata_coverage(params$extra_keys)
 
 n_excluded <- nrow(noise_stats) - nrow(noise_stats_plot)
 
@@ -1279,7 +1279,7 @@ if (!is.null(candidate_archive) &&
 
 ### Candidate Versioning
 
-This section examines how published values change over time as new data arrives. Each observation may be revised multiple times after its initial release, and the statistics below summarize both how often and how much those revisions occur. Relative revisions measure the magnitude of a revision relative to the signal's own scale. A relative revision of 0.1 means the observation shifted by 10% of its own magnitude across revisions, while values near 1 indicate revisions as large as the signal itself.
+This section examines how published values change over time as new data arrives. Each observation may be revised multiple times after its initial release, and the statistics below summarize both how often and how much those revisions occur. Relative revisions measure the magnitude of a revision relative to the indicator's own scale. A relative revision of 0.1 means the observation shifted by 10% of its own magnitude across revisions, while values near 1 indicate revisions as large as the indicator itself.
 
 ```{r}
 #| label: revision-analysis-text
@@ -1422,7 +1422,7 @@ if (nrow(rev_by_loc) > 0) {
     }
     DT::datatable(rev_by_loc_display,
         colnames = c(
-            if (multi_signal) "Signal" else NULL,
+            if (multi_signal) "Indicator" else NULL,
             "Location", "Versions", "Avg. Revisions", "Min Lag", "Max Lag",
             "Avg. Spread", "Avg. Rel. Spread", "Lag Near Latest"
         ),
@@ -1482,12 +1482,13 @@ if (nrow(rev_by_loc) > 0 && n_locations > 1) {
 
 
 
-### Signal sanity checks
+### Indicator sanity checks
 
 This section is by its nature more difficult than others to do systematically. Things to look for:
 
-- If it's a percentile, is it between 0 and 100?
-- If it's a rate, is it roughly proportional to population? *(requires external population data — inspect manually)*
+- Do the values you see match the values you expected to see? This is the check that catches the most, and only you can make it: state the range, level and shape you expected from the indicator's definition before reading the plots, then compare.
+- If it's a percentage or percentile, is it between 0 and 100?
+- If it's a count, is it roughly proportional to the population of each location? A count that does not scale with population points at a coverage or denominator problem. A rate or percentage is already normalized, so the level should instead be roughly comparable across locations of very different sizes, and a location whose level is far off the rest is worth investigating. Note that the relevant denominator is usually not the whole resident population but the part of it the source observes (for example, the patients of one healthcare system). *(requires external population data — inspect manually)*
 - Are the actual values reasonable? E.g. if it's a percentage, does it ever approach 100 outside of literal pandemics?
 - If it's for a seasonal disease, are rates highest in the winter and lowest in the summer?
 - Are geo-aggregated coarser levels plausible aggregations? *(checked below for state-level indicators vs HHS/nation)*
@@ -1506,7 +1507,7 @@ ggplot(df_candidate_plot, aes(x = value)) +
     scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
     {if (multi_signal) facet_wrap(~indicator, scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
     labs(
-        title = if (multi_signal) "Value distribution by signal"
+        title = if (multi_signal) "Value distribution by indicator"
                 else sprintf("Value distribution: %s", signal_labels[signals_vec]),
         subtitle = sprintf(
             "%s observations across %d locations",
@@ -1520,27 +1521,30 @@ ggplot(df_candidate_plot, aes(x = value)) +
 #| label: sanity-value-range-table
 #| echo: false
 range_tbl <- df_candidate %>%
-    group_by(signal, geo_value) %>%
+    as_tibble() %>%
+    filter(!is.na(value)) %>%
+    group_by(across(all_of(c("signal", params$extra_keys, "geo_value")))) %>%
     summarize(
         n = n(),
-        min = min(value, na.rm = TRUE),
-        p05 = quantile(value, 0.05, na.rm = TRUE),
-        median = median(value, na.rm = TRUE),
-        p95 = quantile(value, 0.95, na.rm = TRUE),
-        max = max(value, na.rm = TRUE),
+        min = min(value),
+        p05 = quantile(value, 0.05),
+        median = median(value),
+        p95 = quantile(value, 0.95),
+        max = max(value),
         .groups = "drop"
     ) %>%
     mutate(signal_label = signal_labels[signal]) %>%
     arrange(desc(max)) %>%
-    {
-        if (multi_signal) select(., signal_label, geo_value, n:max)
-        else select(., geo_value, n:max)
-    }
+    select(
+        any_of(if (multi_signal) "signal_label" else character(0)),
+        all_of(params$extra_keys), geo_value, n:max
+    )
 
 DT::datatable(
     range_tbl,
     colnames = c(
-        if (multi_signal) "Signal" else NULL,
+        if (multi_signal) "Indicator" else NULL,
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
         "Location", "N", "Min", "5th pct", "Median", "95th pct", "Max"
     ),
     caption = sprintf(
@@ -1552,28 +1556,18 @@ DT::datatable(
         scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
         paging = TRUE, dom = "tp"
     )
-) %>% DT::formatRound(columns = if (multi_signal) 4:8 else 3:7, digits = 3)
+) %>% DT::formatRound(columns = which(names(range_tbl) %in% c("min", "p05", "median", "p95", "max")), digits = 3)
 ```
 
-The plot below shows the seasonal pattern of the indicator, with each panel representing one epidemiological year (June–May). The line traces the monthly median across all locations, the inner band covers the interquartile range, and the outer band spans the full observed range.
+The plot below shows the seasonal pattern of the indicator, with each panel representing one epidemiological year (`r season_label`). That boundary is set by the `season_start_month` parameter; it defaults to July so that a northern-hemisphere respiratory season falls inside a single panel, following the usual influenza convention. Set it to another month for indicators whose season peaks elsewhere in the year. The line traces the monthly median across all locations, the inner band covers the interquartile range, and the outer band spans the full observed range.
 
 ```{r}
 #| label: sanity-seasonality
 #| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2.5), 15)
 #| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
-
-season_month_labels <- function(x) {
-c("Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May")[x]
-}
-
 df_seasonal <- df_candidate %>%
-    mutate(
-        yr = as.integer(format(time_value, "%Y")),
-        month = as.integer(format(time_value, "%m")),
-        season_start = if_else(month >= 6L, yr, yr - 1L),
-        season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
-        season_month = if_else(month >= 6L, month - 5L, month + 7L)
-    ) %>%
+    as_tibble() %>%
+    add_season() %>%
     group_by(signal, season, season_month, across(all_of(params$extra_keys))) %>%
     summarize(
         median_val = median(value, na.rm = TRUE),
@@ -1588,7 +1582,8 @@ df_seasonal <- df_candidate %>%
         count(., across(all_of(c("signal", "season", params$extra_keys)))) %>% filter(n >= 3),
         by = c("signal", "season", params$extra_keys)
     ) %>%
-    mutate(signal_label = signal_labels[signal])
+    mutate(signal_label = signal_labels[signal]) %>%
+    label_strata_coverage(params$extra_keys)
 
 ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group = season)) +
     geom_ribbon(aes(ymin = min_val, ymax = max_val), alpha = 0.10, linewidth = 0.2) +
@@ -1606,7 +1601,7 @@ ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group =
     scale_x_continuous(labels = season_month_labels) +
     scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
     labs(
-        title = if (multi_signal) "Seasonal patterns by signal"
+        title = if (multi_signal) "Seasonal patterns by indicator"
                 else sprintf("Seasonal pattern: %s", signal_labels[signals_vec]),
         subtitle = "Median by month across all locations — inner band: IQR, outer band: full range",
         x = "Month", y = "Median value"
@@ -1744,7 +1739,7 @@ if (nrow(violations) == 0) {
     print(htmltools::tagList(
         DT::datatable(
             violations,
-            colnames = c("Level", "Signal", "Date", "Geo", "Agg Value", "State Min", "State Max", "Direction", "N States"),
+            colnames = c("Level", "Indicator", "Date", "Geo", "Agg Value", "State Min", "State Max", "Direction", "N States"),
             caption = sprintf(
                 "Geo-aggregation bounds check for %s. Aggregated values should fall within [min, max] of constituent state values.",
                 paste(name_vec, collapse = ", ")
@@ -1770,31 +1765,27 @@ The table below flags locations whose seasonal peak is at least twice the typica
 #| echo: false
 #| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
 df_seasonal_loc <- df_candidate %>%
-    mutate(
-        yr = as.integer(format(time_value, "%Y")),
-        month = as.integer(format(time_value, "%m")),
-        season_start = if_else(month >= 6L, yr, yr - 1L),
-        season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L))
-    ) %>%
-    group_by(signal, season, geo_value) %>%
+    as_tibble() %>%
+    add_season() %>%
+    group_by(across(all_of(c("signal", params$extra_keys, "season", "geo_value")))) %>%
     summarize(loc_max = max(value, na.rm = TRUE), .groups = "drop")
 
 typical_max <- df_seasonal_loc %>%
-    group_by(signal, season) %>%
+    group_by(across(all_of(c("signal", params$extra_keys, "season")))) %>%
     summarize(typical_max = median(loc_max, na.rm = TRUE), .groups = "drop")
 
 anomalies <- df_seasonal_loc %>%
-    left_join(typical_max, by = c("signal", "season")) %>%
+    left_join(typical_max, by = c("signal", params$extra_keys, "season")) %>%
     mutate(
         ratio        = loc_max / typical_max,
         signal_label = signal_labels[signal]
     ) %>%
     filter(ratio >= 2) %>%
     arrange(desc(ratio)) %>%
-    {
-        if (multi_signal) select(., signal_label, season, geo_value, loc_max, typical_max, ratio)
-        else select(., season, geo_value, loc_max, typical_max, ratio)
-    }
+    select(
+        any_of(if (multi_signal) "signal_label" else character(0)),
+        all_of(params$extra_keys), season, geo_value, loc_max, typical_max, ratio
+    )
 
 if (nrow(anomalies) == 0) {
     cat("No locations found with a seasonal max more than 2x the typical (median) seasonal max.")
@@ -1802,7 +1793,8 @@ if (nrow(anomalies) == 0) {
     DT::datatable(
         anomalies,
         colnames = c(
-            if (multi_signal) "Signal" else NULL,
+            if (multi_signal) "Indicator" else NULL,
+            str_to_title(str_replace_all(params$extra_keys, "_", " ")),
             "Season", "Location", "Location Max", "Typical Max", "Ratio"
         ),
         caption = sprintf(
@@ -1814,6 +1806,6 @@ if (nrow(anomalies) == 0) {
             scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
             paging = TRUE, pageLength = 20, dom = "tp"
         )
-    ) %>% DT::formatRound(columns = if (multi_signal) 4:6 else 3:5, digits = 3)
+    ) %>% DT::formatRound(columns = which(names(anomalies) %in% c("loc_max", "typical_max", "ratio")), digits = 3)
 }
 ```
