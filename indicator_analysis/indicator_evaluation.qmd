@@ -22,6 +22,9 @@ params:
   end_day:
   # Extra key columns beyond geo_value/time_value (character vector), e.g. "age_group"
   extra_keys: !expr "character(0)"
+  # First month of the epidemiological year used by the seasonality panels.
+  # 7 = July-June, the usual influenza convention.
+  season_start_month: 7
   # Maximum locations to show in plots/tables
   max_locations_plot: 60
   max_archive_locs: 60
@@ -57,6 +60,8 @@ if (!exists("params")) {
         time_type = NULL,
         end_day = format(Sys.Date()),
         start_day = format(Sys.Date() - 365 * 2),
+        extra_keys = character(0),
+        season_start_month = 7,
         max_locations_plot = 60,
         max_archive_locs = 60,
         min_archive_days = 60
@@ -310,6 +315,152 @@ format_excluded <- function(locs, names) {
     }
 }
 
+# Helper: order stratum levels the way a reader expects rather than
+# alphabetically. Any aggregate level ("all", "total", ...) comes first, then the
+# remaining levels by their leading number so "5-17" precedes "18-49", with
+# open-ended low bins such as "<1" sorted below their own number.
+order_strata <- function(x) {
+    lv <- sort(unique(as.character(x[!is.na(x)])))
+    is_agg <- tolower(lv) %in% c("all", "total", "overall", "all ages", "all_ages", "any")
+    rest <- lv[!is_agg]
+    num <- suppressWarnings(as.numeric(str_extract(rest, "[0-9]+\\.?[0-9]*")))
+    num <- num - 0.5 * str_detect(tolower(rest), "^\\s*(<|under|less|up to)")
+    factor(x, levels = c(lv[is_agg], rest[order(num, rest, na.last = TRUE)]))
+}
+
+# Helper: order stratum columns and append the number of locations reporting
+# each level to its label. Panels drawn from different location sets are not
+# directly comparable, so the label has to say how many locations each one has.
+label_strata_coverage <- function(df, keys, src) {
+    src <- as_tibble(src) %>% filter(!is.na(value))
+    for (k in keys) {
+        f <- order_strata(df[[k]])
+        lv <- levels(f)
+        cnt <- src %>%
+            group_by(.data[[k]]) %>%
+            summarize(n = n_distinct(geo_value), .groups = "drop")
+        n <- cnt$n[match(lv, as.character(cnt[[k]]))]
+        df[[k]] <- factor(f,
+            levels = lv,
+            labels = if_else(is.na(n), lv, sprintf("%s (%s locs)", lv, n))
+        )
+    }
+    df
+}
+
+# Helper: interactive time series with one dropdown entry per location and one
+# trace per stratum. Missing periods are left as gaps instead of being bridged
+# by the line, markers show which periods actually carry a value, and the
+# confidence band (when the data has one) gets its own legend entry so it can be
+# switched off.
+plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL,
+                                 y_title = "Value", group_prefix = "Location: ") {
+    groups <- as.character(sort(unique(df$geo_value)))
+    strata <- if (is.null(trace_col)) NA_character_ else levels(order_strata(df[[trace_col]]))
+    pal <- setNames(rep_len(dis_pal_list, length(strata)), strata)
+
+    specs <- list()
+    for (g in groups) {
+        ci_labelled <- FALSE
+        for (s in strata) {
+            d <- df %>% filter(geo_value == g)
+            if (!is.na(s)) d <- d %>% filter(.data[[trace_col]] == s)
+            d <- d %>% arrange(time_value)
+            if (nrow(d) == 0 || all(is.na(d$value))) next
+            lab <- if (is.na(s)) y_title else s
+            col <- unname(if (is.na(s)) dis_pal_list[1] else pal[[s]])
+            if (!is.null(ci_cols) && any(!is.na(d[[ci_cols[1]]]))) {
+                specs <- append(specs, list(list(
+                    d = d, col = col, lab = lab, grp = g,
+                    kind = "ci", legend_ok = !ci_labelled
+                )))
+                ci_labelled <- TRUE
+            }
+            specs <- append(specs, list(list(
+                d = d, col = col, lab = lab, grp = g,
+                kind = "line", legend_ok = !is.na(s)
+            )))
+        }
+    }
+    if (length(specs) == 0) return(NULL)
+
+    trace_grp <- map_chr(specs, "grp")
+    legend_ok <- map_lgl(specs, "legend_ok")
+    active <- trace_grp == groups[1]
+
+    p <- reduce(seq_along(specs), function(p, i) {
+        sp <- specs[[i]]
+        if (sp$kind == "ci") {
+            plotly::add_ribbons(p,
+                x = sp$d$time_value,
+                ymin = sp$d[[ci_cols[1]]], ymax = sp$d[[ci_cols[2]]],
+                line = list(width = 0), fillcolor = plotly::toRGB(sp$col, 0.2),
+                name = "Confidence interval", legendgroup = "ci",
+                showlegend = active[i] && legend_ok[i], visible = active[i],
+                hoverinfo = "skip"
+            )
+        } else {
+            plotly::add_trace(p,
+                x = sp$d$time_value, y = sp$d$value,
+                type = "scatter", mode = "lines+markers", connectgaps = FALSE,
+                line = list(color = sp$col, width = 1.5),
+                marker = list(color = sp$col, size = 3),
+                name = sp$lab, legendgroup = sp$lab,
+                showlegend = active[i] && legend_ok[i], visible = active[i],
+                hovertemplate = paste0(
+                    "%{x|%Y-%m-%d}<br>", y_title, ": %{y:.3f}",
+                    "<extra>", sp$lab, "</extra>"
+                )
+            )
+        }
+    }, .init = plotly::plot_ly())
+
+    buttons <- map(groups, function(g) {
+        on <- trace_grp == g
+        list(
+            method = "update",
+            args = list(
+                list(visible = as.list(on), showlegend = as.list(on & legend_ok)),
+                list(title = list(text = paste0(group_prefix, g)))
+            ),
+            label = g
+        )
+    })
+
+    p %>%
+        plotly::layout(
+            title = list(text = paste0(group_prefix, groups[1])),
+            xaxis = list(title = "Date"),
+            yaxis = list(title = y_title, fixedrange = TRUE),
+            legend = list(title = list(text = trace_col %||% "")),
+            updatemenus = list(list(
+                type = "dropdown", active = 0, buttons = buttons, x = 0.05, y = 1.15
+            ))
+        ) %>%
+        plotly::config(modeBarButtonsToRemove = c("zoomIn2d", "zoomOut2d"))
+}
+
+# Helper: assign each observation to an epidemiological year starting in
+# `season_start_month` (7 = July-June, the usual influenza convention).
+season_start_month <- as.integer(params$season_start_month %||% 7L)
+season_label <- sprintf(
+    "%s-%s", month.name[season_start_month],
+    month.name[((season_start_month + 10L) %% 12L) + 1L]
+)
+add_season <- function(df) {
+    df %>%
+        mutate(
+            yr = as.integer(format(time_value, "%Y")),
+            month = as.integer(format(time_value, "%m")),
+            season_start = if_else(month >= season_start_month, yr, yr - 1L),
+            season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
+            season_month = ((month - season_start_month) %% 12L) + 1L
+        )
+}
+season_month_labels <- function(x) {
+    month.abb[((season_start_month - 1L + x - 1L) %% 12L) + 1L]
+}
+
 # Set cache
 cache_path <- file.path(getwd(), "epidatr_cache")
 if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
@@ -323,12 +474,13 @@ This notebook evaluates a **candidate indicator** to understand its characterist
 #| label: print-config
 #| echo: false
 config_tbl <- tibble(
-    Field = c("Source", "Signal(s)", "Label(s)", "Geography", "Period"),
+    Field = c("Source", "Indicator(s)", "Label(s)", "Geography", "Stratifier(s)", "Requested period"),
     Value = c(
         params$source,
         paste(signals_vec, collapse = ", "),
         paste(str_remove(name_vec, "\\n"), collapse = ", "),
         if (is.null(params$geo_type) || !nzchar(params$geo_type)) NA_character_ else params$geo_type,
+        if (length(params$extra_keys) == 0) NA_character_ else paste(params$extra_keys, collapse = ", "),
         paste(params$start_day, "to", params$end_day)
     )
 ) %>%
@@ -425,7 +577,8 @@ if (!is.null(params$input_csv)) {
                     time_value >= as.Date(params$start_day),
                     time_value <= as.Date(params$end_day)
                 ) %>%
-                select(geo_value, any_of("signal"), time_value, any_of(params$extra_keys), value)
+                select(geo_value, any_of("signal"), time_value, any_of(params$extra_keys),
+                       value, any_of(c("ci_lower", "ci_upper")))
         }) %>%
             bind_rows() %>%
             as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
@@ -440,11 +593,66 @@ if (!is.null(params$input_csv)) {
     }
 }
 
+# Determine time type and number of locations. Resolved here (rather than after
+# the archive fetch) so the summary below can report periods and strata.
+env_time_type <- attributes(df_candidate)$metadata$time_type
+if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
+    env_time_type <- params$time_type
+}
+if (is.null(env_time_type) || !nzchar(env_time_type)) {
+    env_time_type <- "day"
+}
+params$time_type <- env_time_type
+
+env_geo_type <- attributes(df_candidate)$metadata$geo_type
+if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
+    params$geo_type <- env_geo_type
+}
+
+n_locations <- n_distinct(df_candidate$geo_value)
+n_periods <- n_distinct(df_candidate$time_value)
+
+# Stratum levels per extra key, and the number of (period x stratum) cells a
+# location could in principle fill. Used here and by the missingness section.
+strata_levels <- map(set_names(params$extra_keys), ~ sort(unique(as.character(df_candidate[[.x]]))))
+n_key_combos <- if (length(params$extra_keys) > 0) {
+    df_candidate %>% as_tibble() %>% distinct(across(all_of(params$extra_keys))) %>% nrow()
+} else {
+    1L
+}
+n_strata_cells <- max(1L, prod(lengths(strata_levels)))
+
 cat(sprintf(
-    "- **Summary**: %s rows across %s locations and %d signal(s)\n",
+    "- **Summary**: %s rows across %s locations, %s %s period(s)%s, and %d indicator(s)\n",
     label_comma()(nrow(df_candidate)),
-    label_comma()(n_distinct(df_candidate$geo_value)),
+    label_comma()(n_locations),
+    label_comma()(n_periods), env_time_type,
+    if (length(params$extra_keys) > 0) {
+        sprintf(
+            ", stratified by %s",
+            paste(sprintf(
+                "%s (%d level(s): %s)", names(strata_levels), lengths(strata_levels),
+                map_chr(strata_levels, ~ paste(levels(order_strata(.x)), collapse = ", "))
+            ), collapse = "; ")
+        )
+    } else "",
     length(signals_vec)
+))
+
+# Length of the requested window, in the indicator's own periods
+req_days <- as.integer(as.Date(params$end_day) - as.Date(params$start_day)) + 1L
+req_periods <- round(req_days / switch(env_time_type,
+    day = 1, week = 7, month = 30.44, year = 365.25, 1
+))
+cat(sprintf(
+    "- **Observed period**: %s to %s (requested %s to %s, about %s %s(s))\n",
+    format(min(df_candidate$time_value)), format(max(df_candidate$time_value)),
+    params$start_day, params$end_day, label_comma()(req_periods), env_time_type
+))
+cat(sprintf(
+    "- **Grid**: %s %s period(s) x %s stratum cell(s) = %s possible values per location\n",
+    label_comma()(n_periods), env_time_type,
+    label_comma()(n_strata_cells), label_comma()(n_periods * n_strata_cells)
 ))
 ```
 
@@ -531,31 +739,6 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
         }
     }
 }
-
-# Determine time type and number of locations
-env_time_type <- attributes(df_candidate)$metadata$time_type
-if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
-    env_time_type <- params$time_type
-}
-if (is.null(env_time_type) || !nzchar(env_time_type)) {
-    env_time_type <- "day"
-}
-params$time_type <- env_time_type
-
-env_geo_type <- attributes(df_candidate)$metadata$geo_type
-if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
-    params$geo_type <- env_geo_type
-}
-
-n_locations <- n_distinct(df_candidate$geo_value)
-
-# Number of extra-key combinations (e.g. age groups) present; 1 when no extra keys.
-# Plots that facet by signal x extra-key scale their height by this.
-n_key_combos <- if (length(params$extra_keys) > 0) {
-    df_candidate %>% as_tibble() %>% distinct(across(all_of(params$extra_keys))) %>% nrow()
-} else {
-    1L
-}
 ```
 
 ```{r}
@@ -574,34 +757,270 @@ cat(sprintf(
 
 The data is aggregated at the `r params$geo_type` level. The dataset contains `r n_locations` valid locations measured at a `r env_time_type`-level frequency.
 
+::: {.content-visible when-meta="multi_location"}
+### Coverage and Missingness
+
+This section comes first because everything after it should be read as a statement about the values that exist. It explores the availability of data across time and space, so that the plots and summaries below can be understood as covering only the non-missing observations.
+
+A value is treated as **missing** when the dataset contains no row for a given (location, period`r if (length(params$extra_keys) > 0) ", stratum" else ""`) cell. The grid of cells a location could fill is the `r label_comma()(n_periods)` `r env_time_type` period(s) observed anywhere in the data`r if (n_strata_cells > 1) sprintf(" times the %s stratum cell(s)", label_comma()(n_strata_cells)) else ""`, so each location has `r label_comma()(n_periods * n_strata_cells)` possible values. Periods before the first date any location reports are outside this grid entirely; the Data Loading summary above contrasts the observed period with the requested one.
+
+The area chart below tracks the number of geographic locations with valid data on any given date, against the `r n_locations` locations present in the dataset (dotted line).
+
+```{r}
+#| label: eda-coverage
+#| echo: false
+#| results: asis
+coverage <- df_candidate %>%
+    group_by(across(all_of(c("signal", "time_value", params$extra_keys)))) %>%
+    summarize(n_available = sum(!is.na(value)), .groups = "drop") %>%
+    mutate(geo_value = "all") %>%
+    as_epi_df(signal_format = "as_is", other_keys = c("signal", params$extra_keys)) %>%
+    as_tibble() %>%
+    mutate(indicator = signal_labels[signal]) %>%
+    label_strata_coverage(params$extra_keys, src = df_candidate)
+
+# The full (period x stratum) x location grid, with an NA value wherever a
+# location has no row. Every missingness figure below is derived from this, so
+# the denominator is the same in the per-location and per-stratum views.
+summary_base <- df_candidate %>%
+    as_tibble() %>%
+    select(all_of(c("signal", "geo_value", "time_value", params$extra_keys)), value) %>%
+    complete(nesting(signal, time_value), !!!rlang::syms(params$extra_keys), geo_value)
+```
+
+```{r}
+#| label: eda-coverage-plot
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2), 12)
+#| echo: true
+ggplot(coverage, aes(x = time_value, y = n_available,
+                     color = indicator, linetype = indicator)) +
+    geom_hline(yintercept = n_locations, linetype = 3, linewidth = 0.4, color = "gray50") +
+    geom_line(linewidth = 0.8) +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_y_continuous(labels = label_comma(), limits = c(0, NA)) +
+    labs(
+        title = "Data coverage over time",
+        subtitle = sprintf("Number of locations with non-missing values per %s (dotted line: %d locations in the dataset)",
+                           env_time_type, n_locations),
+        x = "Date", y = "Number of locations",
+        color = "Indicator", linetype = "Indicator"
+    ) +
+    {if (length(signals_vec) > 6 || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (length(signals_vec) > 6) "indicator", params$extra_keys)), ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
+```
+
+#### Missingness by Stratifier
+
+```{r}
+#| label: eda-missingness-by-stratum
+#| echo: false
+#| eval: !expr length(params$extra_keys) > 0
+strat_miss <- summary_base %>%
+    group_by(across(all_of(c("signal", params$extra_keys)))) %>%
+    summarize(
+        n_possible = n(),
+        n_obs = sum(!is.na(value)),
+        n_locs = n_distinct(geo_value[!is.na(value)]),
+        n_periods_obs = n_distinct(time_value[!is.na(value)]),
+        mean_val = mean(value, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        pct_missing = 100 * (1 - n_obs / n_possible),
+        signal_label = signal_labels[signal]
+    ) %>%
+    arrange(across(all_of(params$extra_keys)), signal) %>%
+    {
+        if (multi_signal) select(., signal_label, all_of(params$extra_keys), n_locs, n_periods_obs, n_obs, n_possible, pct_missing, mean_val)
+        else select(., all_of(params$extra_keys), n_locs, n_periods_obs, n_obs, n_possible, pct_missing, mean_val)
+    }
+
+DT::datatable(
+    strat_miss,
+    colnames = c(
+        if (multi_signal) "Indicator" else NULL,
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+        "Locations Reporting",
+        sprintf("%ss Reporting", str_to_title(env_time_type)),
+        "Values Reported", "Possible Values", "% Missing", "Avg. Value"
+    ),
+    caption = sprintf(
+        "Missingness by stratifier. Possible values = %s %s period(s) x %s location(s) for each stratum.",
+        label_comma()(n_periods), env_time_type, label_comma()(n_locations)
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+) %>% DT::formatRound(columns = if (multi_signal) 7:8 else 6:7, digits = 2)
+```
+
+:::
+
+#### Summary Statistics by Location
+
+This table summarizes the available data across all included locations. Locations with no candidate information are not considered.
+
+```{r}
+#| label: eda-summary
+#| results: asis
+#| echo: false
+# Compute base stats per (signal, geo_value) against the full grid, so that a
+# location missing an entire stratum is counted as missing rather than ignored.
+summary_tbl_all <- summary_base %>%
+    group_by(signal, geo_value) %>%
+    summarize(
+        n_possible = n(),
+        n_obs = sum(!is.na(value)),
+        cand_mean = mean(value, na.rm = TRUE),
+        cand_var = var(value, na.rm = TRUE),
+        cand_miss_frac = 1 - n_obs / n_possible,
+        cand_miss = sprintf("%.1f%%", 100 * (1 - n_obs / n_possible)),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        geo_name     = geo_to_name(geo_value),
+        signal_label = signal_labels[signal]
+    )
+
+excluded_locs_df <- summary_tbl_all %>%
+    filter(is.na(cand_mean) | cand_miss_frac == 1)
+if (nrow(excluded_locs_df) > 0) {
+    for (sig in signals_vec) {
+        ex_sig <- excluded_locs_df %>% filter(signal == sig)
+        if (nrow(ex_sig) > 0) {
+            cat(sprintf(
+                "**Excluded locations (no data) — %s**: %s\n\n",
+                signal_labels[sig],
+                format_excluded(ex_sig$geo_value, ex_sig$geo_name)
+            ))
+        }
+    }
+}
+
+zero_var_cand_locs_df <- summary_tbl_all %>%
+    filter(!is.na(cand_var) & cand_var == 0 & cand_miss_frac < 1)
+if (nrow(zero_var_cand_locs_df) > 0) {
+    for (sig in signals_vec) {
+        zv_sig <- zero_var_cand_locs_df %>% filter(signal == sig)
+        if (nrow(zv_sig) > 0) {
+            cat(sprintf(
+                "**Zero variance locations (flatlined) — %s**: %s\n\n",
+                signal_labels[sig],
+                format_excluded(zv_sig$geo_value, zv_sig$geo_name)
+            ))
+        }
+    }
+}
+
+# Summary of missingness levels per signal
+miss_levels <- summary_tbl_all %>%
+    mutate(
+        cand_miss_group = case_when(
+            cand_miss_frac == 1 ~ "100% missing",
+            cand_miss_frac < 0.05 ~ "<5% missing",
+            cand_miss_frac < 0.25 ~ "5-25% missing",
+            cand_miss_frac < 0.50 ~ "25-50% missing",
+            TRUE ~ "50-99.9% missing"
+        ),
+        cand_miss_group = factor(cand_miss_group, levels = c("<5% missing", "5-25% missing", "25-50% missing", "50-99.9% missing", "100% missing"))
+    )
+
+for (sig in signals_vec) {
+    cat(sprintf("**Missingness Overview%s:**\n\n",
+                if (multi_signal) sprintf(" — %s", signal_labels[sig]) else " (All Locations)"))
+    cand_counts <- miss_levels %>%
+        filter(signal == sig) %>%
+        count(cand_miss_group) %>%
+        complete(cand_miss_group, fill = list(n = 0))
+    for (i in seq_len(nrow(cand_counts))) {
+        cat(sprintf("- **%s**: %d locations\n",
+                    cand_counts$cand_miss_group[i], cand_counts$n[i]))
+    }
+    cat("\n")
+}
+
+summary_tbl <- summary_tbl_all %>%
+    filter(!is.na(cand_mean) & cand_miss_frac < 1) %>%
+    arrange(desc(cand_miss_frac)) %>%
+    {
+        if (multi_signal) select(., signal_label, geo_value, geo_name, n_obs, n_possible, cand_mean, cand_miss)
+        else select(., geo_value, geo_name, n_obs, n_possible, cand_mean, cand_miss)
+    }
+
+DT::datatable(
+    summary_tbl,
+    colnames = c(
+        if (multi_signal) "Indicator" else NULL,
+        sprintf("Geo-level (%s)", params$geo_type),
+        "Name",
+        "Values Reported",
+        "Possible Values",
+        "Avg. Value",
+        "% Missing"
+    ),
+    caption = sprintf(
+        "Summary statistics by location. Possible values per location = %s %s period(s)%s = %s; %% missing is the share of those cells with no reported value.",
+        label_comma()(n_periods), env_time_type,
+        if (n_strata_cells > 1) sprintf(" x %s stratum cell(s)", label_comma()(n_strata_cells)) else "",
+        label_comma()(n_periods * n_strata_cells)
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+) %>% DT::formatRound(columns = if (multi_signal) 6 else 5, digits = 2)
+```
+
 ### Time Series Overview
 
-This section provides a visual overview of the candidate indicator over time for a subset of observation locations. We look at the raw values for the indicator across a sample of locations.
+This section provides a visual overview of the candidate indicator over time, one location at a time (use the dropdown to switch). Values are shown as published: the line breaks wherever a period has no reported value, and each marker is one reported observation, so gaps in coverage read as gaps rather than as interpolated straight lines.
 
 ```{r}
 #| label: eda-overview
 #| fig-height: 4
+#| results: asis
 # Pick a diverse sample of locations for visualization
 all_geos <- sort(unique(df_candidate$geo_value))
 n_plot <- min(length(all_geos), params$max_locations_plot)
 sample_geos <- random_sample(all_geos, n_plot)
 
-df_sample <- df_candidate %>%
-    filter(geo_value %in% sample_geos)
+# Confidence bounds are plotted when the source supplies them.
+ci_cols <- intersect(c("ci_lower", "ci_upper"), colnames(df_candidate))
+if (length(ci_cols) < 2) ci_cols <- NULL
 
-autoplot(df_sample, value,
-        .interactive = TRUE, .facet_by = "geo_value", .facet_to_dropdown = TRUE) %>%
-        plotly::toWebGL() %>%
-        plotly::partial_bundle()
+df_sample <- df_candidate %>%
+    as_tibble() %>%
+    filter(geo_value %in% sample_geos) %>%
+    # Fill the grid so that missing periods become explicit NAs; plotly then
+    # leaves a gap instead of joining across them.
+    complete(nesting(signal, time_value), !!!rlang::syms(params$extra_keys), geo_value) %>%
+    mutate(indicator = signal_labels[signal])
+
+if (!is.null(ci_cols)) {
+    cat("Shaded bands are the confidence interval reported with each value; click **Confidence interval** in the legend to hide them.\n\n")
+}
+
+# One plot per indicator so the dropdown only ever switches location.
+overview_plots <- map(signals_vec, function(sig) {
+    d <- df_sample %>% filter(signal == sig)
+    p <- plot_series_dropdown(
+        d,
+        trace_col = if (length(params$extra_keys) > 0) params$extra_keys[1] else NULL,
+        ci_cols = ci_cols,
+        y_title = "Value"
+    )
+    if (is.null(p)) return(NULL)
+    p <- p %>% plotly::toWebGL() %>% plotly::partial_bundle()
+    if (!multi_signal) return(p)
+    htmltools::tagList(htmltools::tags$h5(signal_labels[sig]), p)
+}) %>% compact()
+
+if (multi_signal) htmltools::tagList(overview_plots) else overview_plots[[1]]
 ```
 
 ::: {.content-visible when-meta="multi_location"}
 
 ### Quantile Trends
 
-This plot displays the distribution of both indicators over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use different scales for the top and bottom panels so each indicator's distribution is clearly visible.
+This plot displays the distribution of the indicator over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use a different scale for each panel so each distribution is clearly visible.
 
 By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.
+
+Each quantile is taken across whichever locations reported a value in that window, so panels whose location counts differ (shown in each panel label) are not directly comparable. A spike confined to one panel is often a composition effect: a location that reports only the aggregate stratum, on a small denominator, can move that panel's upper quantile without appearing in any other panel.
 
 ```{r}
 #| label: eda-quantiles
@@ -643,7 +1062,9 @@ df_quantiles_wide <- df_quantiles_wide %>%
         .window_size = window_size
     ) %>%
     ungroup() %>%
-    mutate(indicator = signal_labels[signal])
+    as_tibble() %>%
+    mutate(indicator = signal_labels[signal]) %>%
+    label_strata_coverage(params$extra_keys, src = df_candidate)
 
 ggplot(df_quantiles_wide, aes(x = time_value)) +
     geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
@@ -656,7 +1077,8 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
     scale_color_manual(values = c("Median" = dis_pal_list[2])) +
     labs(
         title = "Smoothed Quantile Trends",
-        subtitle = sprintf("Across all %d locations, smoothed window: %s", n_locations, format(window_size)),
+        subtitle = sprintf("Across the locations reporting each panel (of %d in total), smoothed window: %s",
+                           n_locations, format(window_size)),
         x = "Date", y = "Value (smoothed)",
         fill = "Range", color = "Trend"
     ) +
@@ -727,178 +1149,6 @@ if (nrow(aberrant_locs) > 0) {
 
 
 :::
-
-::: {.content-visible when-meta="multi_location"}
-### Coverage and Missingness
-
-This section explores the availability of data across time and space. The area chart below tracks the number of geographic locations with valid data on any given date for the candidate indicator.
-
-```{r}
-#| label: eda-coverage
-#| echo: false
-#| results: asis
-coverage <- df_candidate %>%
-    group_by(across(all_of(c("signal", "time_value", params$extra_keys)))) %>%
-    summarize(n_available = sum(!is.na(value)), .groups = "drop") %>%
-    mutate(geo_value = "all") %>%
-    as_epi_df(signal_format = "as_is", other_keys = c("signal", params$extra_keys))
-
-# Determine smoothing window based on time type
-slide_window <- switch(env_time_type %||% "unknown",
-    day = 7L,
-    week = 4L,
-    month = 3L,
-    1L
-)
-
-if (env_time_type != params$time_type &&slide_window > 1) {
-    coverage <- coverage %>%
-        group_by(across(all_of(c("geo_value", "signal", params$extra_keys)))) %>%
-        epi_slide(
-            n_available_smooth = mean(n_available, na.rm = TRUE),
-            .window_size = slide_window
-        ) %>%
-        ungroup() %>%
-        mutate(n_available = n_available_smooth)
-}
-
-coverage <- coverage %>%
-    mutate(indicator = signal_labels[signal])
-```
-
-```{r}
-#| label: eda-coverage-plot
-#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2), 12)
-#| echo: true
-ggplot(coverage, aes(x = time_value, y = n_available,
-                     color = indicator, linetype = indicator)) +
-    geom_line(linewidth = 0.8) +
-    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
-    scale_y_continuous(labels = label_comma(), limits = c(0, NA)) +
-    labs(
-        title = "Data coverage over time",
-        subtitle = sprintf("Number of locations with non-missing values per %s%s", env_time_type,
-                           if (env_time_type != params$time_type && slide_window > 1) sprintf(" (%d-%s rolling average)", slide_window, env_time_type) else ""),
-        x = "Date", y = "Number of locations",
-        color = "Indicator", linetype = "Indicator"
-    ) +
-    {if (length(signals_vec) > 6 || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (length(signals_vec) > 6) "indicator", params$extra_keys)), ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
-```
-
-
-:::
-
-
-#### Summary Statistics by Location
-
-This table summarizes the available data across all included locations. Locations with no candidate information are not considered.
-
-```{r}
-#| label: eda-summary
-#| results: asis
-#| echo: false
-# Compute base stats per (signal, geo_value)
-summary_tbl_all <- df_candidate %>%
-    complete(signal, geo_value, time_value) %>%
-    group_by(signal, geo_value) %>%
-    summarize(
-        n_days = n(),
-        cand_mean = mean(value, na.rm = TRUE),
-        cand_var = var(value, na.rm = TRUE),
-        cand_miss_frac = mean(is.na(value)),
-        cand_miss = sprintf("%.1f%%", 100 * cand_miss_frac),
-        .groups = "drop"
-    ) %>%
-    mutate(
-        geo_name     = geo_to_name(geo_value),
-        signal_label = signal_labels[signal]
-    )
-
-excluded_locs_df <- summary_tbl_all %>%
-    filter(is.na(cand_mean) | cand_miss_frac == 1)
-if (nrow(excluded_locs_df) > 0) {
-    for (sig in signals_vec) {
-        ex_sig <- excluded_locs_df %>% filter(signal == sig)
-        if (nrow(ex_sig) > 0) {
-            cat(sprintf(
-                "**Excluded locations (no data) — %s**: %s\n\n",
-                signal_labels[sig],
-                format_excluded(ex_sig$geo_value, ex_sig$geo_name)
-            ))
-        }
-    }
-}
-
-zero_var_cand_locs_df <- summary_tbl_all %>%
-    filter(!is.na(cand_var) & cand_var == 0 & cand_miss_frac < 1)
-if (nrow(zero_var_cand_locs_df) > 0) {
-    for (sig in signals_vec) {
-        zv_sig <- zero_var_cand_locs_df %>% filter(signal == sig)
-        if (nrow(zv_sig) > 0) {
-            cat(sprintf(
-                "**Zero variance locations (flatlined) — %s**: %s\n\n",
-                signal_labels[sig],
-                format_excluded(zv_sig$geo_value, zv_sig$geo_name)
-            ))
-        }
-    }
-}
-
-# Summary of missingness levels per signal
-miss_levels <- summary_tbl_all %>%
-    mutate(
-        cand_miss_group = case_when(
-            cand_miss_frac == 1 ~ "100% missing",
-            cand_miss_frac < 0.05 ~ "<5% missing",
-            cand_miss_frac < 0.25 ~ "5-25% missing",
-            cand_miss_frac < 0.50 ~ "25-50% missing",
-            TRUE ~ "50-99.9% missing"
-        ),
-        cand_miss_group = factor(cand_miss_group, levels = c("<5% missing", "5-25% missing", "25-50% missing", "50-99.9% missing", "100% missing"))
-    )
-
-for (sig in signals_vec) {
-    cat(sprintf("**Missingness Overview%s:**\n\n",
-                if (multi_signal) sprintf(" — %s", signal_labels[sig]) else " (All Locations)"))
-    cand_counts <- miss_levels %>%
-        filter(signal == sig) %>%
-        count(cand_miss_group) %>%
-        complete(cand_miss_group, fill = list(n = 0))
-    for (i in seq_len(nrow(cand_counts))) {
-        cat(sprintf("- **%s**: %d locations\n",
-                    cand_counts$cand_miss_group[i], cand_counts$n[i]))
-    }
-    cat("\n")
-}
-
-summary_tbl <- summary_tbl_all %>%
-    filter(!is.na(cand_mean) & cand_miss_frac < 1) %>%
-    arrange(desc(cand_miss_frac)) %>%
-    {
-        if (multi_signal) select(., signal_label, geo_value, geo_name, n_days, cand_mean, cand_miss)
-        else select(., geo_value, geo_name, n_days, cand_mean, cand_miss)
-    }
-
-DT::datatable(
-    summary_tbl,
-    colnames = c(
-        if (multi_signal) "Signal" else NULL,
-        sprintf("Geo-level (%s)", params$geo_type),
-        "Name",
-        sprintf("Total %s(s)", str_to_title(env_time_type)),
-        "Avg. Value",
-        "% Missing"
-    ),
-    caption = sprintf(
-        "Summary statistics by location. Missingness is calculated against the full analysis window (%d periods).",
-        n_distinct(df_candidate$time_value)
-    ),
-    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-) %>% DT::formatRound(columns = if (multi_signal) 5 else 4, digits = 2)
-```
-
-
-
 
 
 ::: {.content-visible when-meta="multi_location"}
