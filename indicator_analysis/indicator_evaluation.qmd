@@ -25,6 +25,14 @@ params:
   # First month of the epidemiological year used by the seasonality panels.
   # 7 = July-June, the usual influenza convention.
   season_start_month: 7
+  # Smooth the quantile trends with a moving average. Meant for raw data with a
+  # day-of-week effect; set to false for indicators already smoothed at source.
+  smooth_quantiles: true
+  # Show the cross-sectional geographic outlier table (2.2.1)
+  show_geo_outliers: true
+  # Show the versioning summary. Off also skips the version-history query, which
+  # is the slowest part of the report; use revision_analysis.qmd for the detail.
+  show_versioning: true
   # Maximum locations to show in plots/tables
   max_locations_plot: 60
   max_archive_locs: 60
@@ -62,6 +70,9 @@ if (!exists("params")) {
         start_day = format(Sys.Date() - 365 * 2),
         extra_keys = character(0),
         season_start_month = 7,
+        smooth_quantiles = TRUE,
+        show_geo_outliers = TRUE,
+        show_versioning = TRUE,
         max_locations_plot = 60,
         max_archive_locs = 60,
         min_archive_days = 60
@@ -173,6 +184,17 @@ signals_vec <- if (!is.null(params$signal) && length(params$signal) > 0 &&
     character(0)
 }
 multi_signal <- length(signals_vec) > 1
+
+# Keys beyond geo_value/time_value. With more than one indicator, `signal` is
+# part of the key as well: without it, (geo_value, time_value, stratum) is not
+# unique and the epi_df/epi_archive constructors reject the data.
+candidate_keys <- c(if (multi_signal) "signal", params$extra_keys)
+
+# Prose helpers, so the narrative text is plural only when more than one
+# indicator was loaded. Used inline in the markdown between the chunks.
+ind <- if (multi_signal) "indicators" else "indicator"
+ind_poss <- if (multi_signal) "indicators'" else "indicator's"
+sg_pl <- function(singular, plural) if (multi_signal) plural else singular
 
 # Build signal labels (name falls back to signal if not provided)
 name_vec <- {
@@ -350,17 +372,33 @@ label_strata_coverage <- function(df, keys, src = df_candidate) {
 
 # Helper: interactive time series with one dropdown entry per location and one
 # trace per stratum. Missing periods are left as gaps instead of being bridged
-# by the line, markers show which periods actually carry a value, and the
-# confidence band (when the data has one) gets its own legend entry so it can be
-# switched off.
+# by the line, and markers show which periods actually carry a value. A
+# confidence band (when the data has one) shares its stratum's legend entry, so
+# hiding a stratum hides its band with it.
 plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
     groups <- as.character(sort(unique(df$geo_value)))
+    # An estimate on a near-empty denominator carries an interval about as wide
+    # as the indicator's entire range. Drawn, it is a full-height column that
+    # buries every series behind it while saying nothing, so leave those out and
+    # report how many below the plot. The cut-off is the span of the values
+    # themselves, so it scales with the indicator instead of being a constant.
+    band_limit <- if (!is.null(ci_cols)) diff(range(df$value, na.rm = TRUE)) else NULL
+    n_band_wide <- 0L
+    n_band_obs <- 0L
     strata <- if (is.null(trace_col)) NA_character_ else levels(order_strata(df[[trace_col]]))
-    pal <- setNames(rep_len(dis_pal_list, length(strata)), strata)
+    # One distinct colour per stratum. Recycling the palette would give two
+    # strata the same colour, which is unreadable once bands are drawn too.
+    pal <- setNames(
+        if (length(strata) <= length(dis_pal_list)) {
+            dis_pal_list[seq_along(strata)]
+        } else {
+            grDevices::colorRampPalette(dis_pal_list)(length(strata))
+        },
+        strata
+    )
 
     specs <- list()
     for (g in groups) {
-        ci_labelled <- FALSE
         for (s in strata) {
             d <- df %>% filter(geo_value == g)
             if (!is.na(s)) d <- d %>% filter(.data[[trace_col]] == s)
@@ -368,12 +406,24 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
             if (nrow(d) == 0 || all(is.na(d$value))) next
             lab <- if (is.na(s)) "Value" else s
             col <- unname(if (is.na(s)) dis_pal_list[1] else pal[[s]])
-            if (!is.null(ci_cols) && any(!is.na(d[[ci_cols[1]]]))) {
-                specs <- append(specs, list(list(
-                    d = d, col = col, lab = lab, grp = g,
-                    kind = "ci", legend_ok = !ci_labelled
-                )))
-                ci_labelled <- TRUE
+            if (!is.null(ci_cols)) {
+                # One band per contiguous run of reported bounds. A band is
+                # drawn as a c(x, rev(x)) polygon, and an NA anywhere inside it
+                # shifts the return leg, pairing each lower bound with the wrong
+                # period and detaching the band from its line. Splitting on the
+                # gaps also stops a band from spanning a period with no data,
+                # which is what the line already does.
+                ok <- !is.na(d[[ci_cols[1]]]) & !is.na(d[[ci_cols[2]]])
+                too_wide <- ok & (d[[ci_cols[2]]] - d[[ci_cols[1]]]) > band_limit
+                n_band_obs <- n_band_obs + sum(ok)
+                n_band_wide <- n_band_wide + sum(too_wide)
+                ok <- ok & !too_wide
+                for (seg in split(d[ok, , drop = FALSE], cumsum(!ok)[ok])) {
+                    specs <- append(specs, list(list(
+                        d = seg, col = col, lab = lab, grp = g,
+                        kind = "ci", legend_ok = FALSE
+                    )))
+                }
             }
             specs <- append(specs, list(list(
                 d = d, col = col, lab = lab, grp = g,
@@ -394,8 +444,8 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
                 x = sp$d$time_value,
                 ymin = sp$d[[ci_cols[1]]], ymax = sp$d[[ci_cols[2]]],
                 line = list(width = 0), fillcolor = plotly::toRGB(sp$col, 0.2),
-                name = "Confidence interval", legendgroup = "ci",
-                showlegend = active[i] && legend_ok[i], visible = active[i],
+                name = sp$lab, legendgroup = sp$lab,
+                showlegend = FALSE, visible = active[i],
                 hoverinfo = "skip"
             )
         } else {
@@ -414,6 +464,20 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
         }
     }, .init = plotly::plot_ly())
 
+    # Scale the y axis to the values, not to the bands. A near-empty denominator
+    # produces a confidence interval spanning almost the whole range of the
+    # indicator (here 10% of Alabama's rows reach above 90%), and letting those
+    # set the axis compresses every series into a sliver along the bottom, so the
+    # line reads as if its band belonged to something else. Bands reaching past
+    # the top are clipped there; the y axis stays zoomable so they can be seen.
+    yrange <- NULL
+    if (!is.null(ci_cols)) {
+        vals <- df$value[is.finite(df$value)]
+        if (length(vals) > 0 && diff(range(vals)) > 0) {
+            yrange <- c(min(0, min(vals)), max(vals) + 0.15 * diff(range(vals)))
+        }
+    }
+
     buttons <- map(groups, function(g) {
         on <- trace_grp == g
         list(
@@ -426,18 +490,28 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
         )
     })
 
-    p %>%
+    p <- p %>%
         plotly::layout(
             title = list(text = paste0("Location: ", groups[1])),
             xaxis = list(title = "Date"),
-            yaxis = list(title = "Value", fixedrange = TRUE),
+            yaxis = list(title = "Value", range = yrange),
             legend = list(title = list(text = trace_col %||% "")),
             updatemenus = list(list(
                 type = "dropdown", active = 0, buttons = buttons, x = 0.05, y = 1.15
             ))
         ) %>%
         plotly::config(modeBarButtonsToRemove = c("zoomIn2d", "zoomOut2d"))
+
+    # Counts ride along on the returned plot so the chunk can report them.
+    attr(p, "bands_wide") <- n_band_wide
+    attr(p, "bands_total") <- n_band_obs
+    p
 }
+
+# Optional-section switches; all default to on when the param is absent.
+smooth_quantiles <- !isFALSE(params$smooth_quantiles)
+show_geo_outliers <- !isFALSE(params$show_geo_outliers)
+show_versioning <- !isFALSE(params$show_versioning)
 
 # Helper: assign each observation to an epidemiological year starting in
 # `season_start_month` (7 = July-June, the usual influenza convention).
@@ -467,7 +541,7 @@ if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
 set_cache(cache_dir = cache_path)
 ```
 
-This notebook evaluates a **candidate indicator** to understand its characteristics, coverage, missingness, and versioning/revision behavior.
+This notebook evaluates `r sg_pl("a **candidate indicator**", "the **candidate indicators**")` to understand `r sg_pl("its", "their")` characteristics, coverage, missingness, and versioning/revision behavior.
 
 ```{r}
 #| label: print-config
@@ -520,14 +594,31 @@ if (!is.null(params$input_csv)) {
                 if ("issue" %in% names(.)) rename(., version = issue) else .
             } %>%
             mutate(version = as.Date(version))
+
+        # A row with no version cannot be placed on a version timeline. Drop
+        # those rows and say how many, because a file holding both versioned and
+        # unversioned copies of the same observations is usually a build
+        # accident, and keeping them would double every series.
+        n_no_version <- sum(is.na(df_candidate_raw$version))
+        if (n_no_version > 0) {
+            cat(sprintf(
+                "- **Warning**: %s of %s CSV rows carry no version and were dropped.\n",
+                label_comma()(n_no_version), label_comma()(nrow(df_candidate_raw))
+            ))
+            df_candidate_raw <- df_candidate_raw %>% filter(!is.na(version))
+        }
+
+        # Confidence bounds ride along as extra value columns, so the overview
+        # plot can draw bands for versioned CSVs too.
         csv_archive_df  <- df_candidate_raw %>%
-            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys), value) %>%
+            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys),
+                   value, any_of(c("ci_lower", "ci_upper"))) %>%
             group_by(geo_value, time_value, version, pick(any_of(c("signal", params$extra_keys)))) %>%
             slice_max(value, n = 1, with_ties = FALSE) %>%
             ungroup()
 
         candidate_archive <- csv_archive_df %>%
-            as_epi_archive(signal_format = "as_is", other_keys = params$extra_keys)
+            as_epi_archive(signal_format = "as_is", other_keys = candidate_keys)
         df_candidate <- epix_as_of(candidate_archive, candidate_archive$versions_end)
         cat(sprintf(
             "- CSV contains version history: %s versions\n",
@@ -535,7 +626,7 @@ if (!is.null(params$input_csv)) {
         ))
     } else {
         df_candidate <- df_candidate_raw %>%
-            as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
+            as_epi_df(signal_format = "as_is", other_keys = candidate_keys)
     }
 } else {
     # Determine if new API can be used for candidate source
@@ -580,7 +671,7 @@ if (!is.null(params$input_csv)) {
                        value, any_of(c("ci_lower", "ci_upper")))
         }) %>%
             bind_rows() %>%
-            as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
+            as_epi_df(signal_format = "as_is", other_keys = candidate_keys)
     } else {
         # pub_covidcast accepts a signal vector and returns a signal column
         df_candidate <- pub_covidcast(
@@ -588,7 +679,7 @@ if (!is.null(params$input_csv)) {
             params$geo_type, params$time_type,
             time_values = time_range(params$start_day, params$end_day),
             as_of = Sys.Date()
-        ) %>% as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
+        ) %>% as_epi_df(signal_format = "as_is", other_keys = candidate_keys)
     }
 }
 
@@ -658,8 +749,9 @@ cat(sprintf(
 ```{r}
 #| label: load-candidate-archive
 #| results: asis
-# Fetch revision history from API if not already built from CSV
-if (is.null(candidate_archive) && is.null(params$input_csv)) {
+# Fetch revision history from API if not already built from CSV. Skipped entirely
+# when the versioning section is off — the issues = "*" query is the slowest one.
+if (show_versioning && is.null(candidate_archive) && is.null(params$input_csv)) {
     # Only fetch version history if the source supports revisions
     new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
     use_new_api <- FALSE
@@ -734,7 +826,7 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
             archive_info$version_start <- min(df_archive_raw$version)
             archive_info$version_end <- max(df_archive_raw$version)
             candidate_archive <- df_archive_raw %>%
-                as_epi_archive(signal_format = "as_is", other_keys = params$extra_keys)
+                as_epi_archive(signal_format = "as_is", other_keys = candidate_keys)
         }
     }
 }
@@ -747,14 +839,18 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
 # Dynamically set Quarto metadata so we can use it in ::: {.content-visible}
 # blocks later.
 cat(sprintf(
-    "\n---\nmulti_location: %s\n---\n",
-    tolower(n_locations > 1)
+    "\n---\nmulti_location: %s\ngeo_outliers: %s\nversioning: %s\n---\n",
+    tolower(n_locations > 1),
+    tolower(show_geo_outliers && n_locations > 1),
+    tolower(show_versioning)
 ))
 ```
 
 ## Exploratory Data Analysis {#eda}
 
 The data is aggregated at the `r params$geo_type` level. The dataset contains `r n_locations` valid locations measured at a `r env_time_type`-level frequency.
+
+Throughout this notebook, an **observation** (equivalently, a reported value) is one row of the dataset: a single value for one location, one `r env_time_type``r if (length(params$extra_keys) > 0) sprintf(" and one level of %s", paste(params$extra_keys, collapse = "/")) else ""`. A **location** is one `r params$geo_type`, and counts of locations are counts of distinct `r params$geo_type`s, not of observations.
 
 ::: {.content-visible when-meta="multi_location"}
 ### Coverage and Missingness
@@ -825,7 +921,8 @@ strat_miss <- summary_base %>%
     ) %>%
     mutate(
         pct_missing = 100 * (1 - n_obs / n_possible),
-        signal_label = signal_labels[signal]
+        signal_label = signal_labels[signal],
+        across(all_of(params$extra_keys), order_strata)
     ) %>%
     arrange(across(all_of(params$extra_keys)), signal) %>%
     {
@@ -966,7 +1063,7 @@ DT::datatable(
 
 ### Time Series Overview
 
-This section provides a visual overview of the candidate indicator over time, one location at a time (use the dropdown to switch). Values are shown as published: the line breaks wherever a period has no reported value, and each marker is one reported observation, so gaps in coverage read as gaps rather than as interpolated straight lines.
+This section provides a visual overview of the candidate `r ind` over time, one location at a time (use the dropdown to switch). Values are shown as published: the line breaks wherever a period has no reported value, and each marker is one reported observation, so gaps in coverage read as gaps rather than as interpolated straight lines.
 
 ```{r}
 #| label: eda-overview
@@ -990,10 +1087,17 @@ df_sample <- df_candidate %>%
     mutate(indicator = signal_labels[signal])
 
 if (!is.null(ci_cols)) {
-    cat("Shaded bands are the confidence interval reported with each value; click **Confidence interval** in the legend to hide them.\n\n")
+    cat(sprintf(
+        "Shaded bands are the confidence interval reported with each value%s.\n\n",
+        if (length(params$extra_keys) > 0) {
+            sprintf(", drawn in the colour of their %s and sharing its legend entry, so clicking a %s in the legend hides its line and its band together",
+                    params$extra_keys[1], params$extra_keys[1])
+        } else ""
+    ))
 }
 
 # One plot per indicator so the dropdown only ever switches location.
+band_notes <- c()
 overview_plots <- map(signals_vec, function(sig) {
     d <- df_sample %>% filter(signal == sig)
     p <- plot_series_dropdown(
@@ -1004,10 +1108,28 @@ overview_plots <- map(signals_vec, function(sig) {
         ci_cols = ci_cols
     )
     if (is.null(p)) return(NULL)
-    p <- p %>% plotly::toWebGL() %>% plotly::partial_bundle()
+    if (!is.null(attr(p, "bands_wide")) && attr(p, "bands_wide") > 0) {
+        band_notes[[sig]] <<- sprintf(
+            "%s%s of %s reported values (%s) carry an interval wider than the full range of the values themselves, so no band is drawn for them",
+            if (multi_signal) sprintf("%s: ", signal_labels[sig]) else "",
+            label_comma()(attr(p, "bands_wide")), label_comma()(attr(p, "bands_total")),
+            label_percent(accuracy = 0.1)(attr(p, "bands_wide") / attr(p, "bands_total"))
+        )
+    }
+    # Kept as SVG (no toWebGL): WebGL cannot fill a ribbon polygon, so it would
+    # break the bands. Only one location is visible at a time, so the rendered
+    # trace count is small and SVG is fast enough.
+    p <- p %>% plotly::partial_bundle()
     if (!multi_signal) return(p)
     htmltools::tagList(htmltools::tags$h5(signal_labels[sig]), p)
 }) %>% compact()
+
+if (length(band_notes) > 0) {
+    cat(sprintf(
+        "An estimate resting on almost no denominator has a confidence interval about as wide as the indicator itself; drawn, it is a full-height column that hides every other series. %s. Those observations still show as a line and a marker, and the y axis is scaled to the values rather than to the bands, so a band running off the top of the plot is clipped there — zoom out to see it.\n\n",
+        paste(band_notes, collapse = "; ")
+    ))
+}
 
 if (multi_signal) htmltools::tagList(overview_plots) else overview_plots[[1]]
 ```
@@ -1016,11 +1138,13 @@ if (multi_signal) htmltools::tagList(overview_plots) else overview_plots[[1]]
 
 ### Quantile Trends
 
-This plot displays the distribution of the indicator over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use a different scale for each panel so each distribution is clearly visible.
+`r sg_pl("This plot displays", "These plots display")` the distribution of the `r ind` over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range (the middle 50% of locations), and the outer ribbon covers the 5th to 95th percentile range. We use a different scale for each panel so each distribution is clearly visible.
 
-By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.
+`r if (smooth_quantiles) "The quantiles are smoothed with a moving average. That is aimed at raw data with a day-of-week effect, which would otherwise dominate the ribbons; an indicator already smoothed at the source does not need it, and smoothing it again only widens the effective window. Set the <code>smooth_quantiles</code> parameter to <code>false</code> to plot the quantiles as published." else "Quantiles are plotted as published, without additional smoothing (<code>smooth_quantiles: false</code>). Set the parameter to <code>true</code> for raw data where a day-of-week effect would otherwise dominate the ribbons."`
 
-Each quantile is taken across whichever locations reported a value in that window, so panels whose location counts differ (shown in each panel label) are not directly comparable. A spike confined to one panel is often a composition effect: a location that reports only the aggregate stratum, on a small denominator, can move that panel's upper quantile without appearing in any other panel.
+By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the `r ind`.
+
+Each quantile is taken cross whichever locations reported a value in that window, so panels whose location counts differ (shown in each panel label) are not directly comparable. A spike confined to one panel is often a composition effect: a location that reports only the aggregate stratum, on a small denominator, can move that panel's upper quantile without appearing in any other panel.
 
 ```{r}
 #| label: eda-quantiles
@@ -1049,19 +1173,27 @@ window_size <- switch(env_time_type %||% "unknown",
     # (too sparse for sliding averages)
 )
 
-df_quantiles_wide <- df_quantiles_wide %>%
-    group_by(across(all_of(c("geo_value", "signal", params$extra_keys)))) %>%
-    epi_slide(
-        ~ tibble(
-            `0.05` = quantile(unlist(.x$vals), 0.05, na.rm = TRUE),
-            `0.25` = quantile(unlist(.x$vals), 0.25, na.rm = TRUE),
-            `0.5`  = quantile(unlist(.x$vals), 0.5, na.rm = TRUE),
-            `0.75` = quantile(unlist(.x$vals), 0.75, na.rm = TRUE),
-            `0.95` = quantile(unlist(.x$vals), 0.95, na.rm = TRUE)
-        ),
-        .window_size = window_size
-    ) %>%
-    ungroup() %>%
+q_tbl <- function(v) {
+    tibble(
+        `0.05` = quantile(v, 0.05, na.rm = TRUE),
+        `0.25` = quantile(v, 0.25, na.rm = TRUE),
+        `0.5`  = quantile(v, 0.5, na.rm = TRUE),
+        `0.75` = quantile(v, 0.75, na.rm = TRUE),
+        `0.95` = quantile(v, 0.95, na.rm = TRUE)
+    )
+}
+
+df_quantiles_wide <- {
+    if (smooth_quantiles) {
+        df_quantiles_wide %>%
+            group_by(across(all_of(c("geo_value", "signal", params$extra_keys)))) %>%
+            epi_slide(~ q_tbl(unlist(.x$vals)), .window_size = window_size) %>%
+            ungroup()
+    } else {
+        # Quantiles of the values published in that period alone.
+        bind_cols(df_quantiles_wide, map_dfr(df_quantiles_wide$vals, q_tbl))
+    }
+} %>%
     as_tibble() %>%
     mutate(indicator = signal_labels[signal]) %>%
     label_strata_coverage(params$extra_keys)
@@ -1076,28 +1208,33 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
     scale_fill_manual(values = c("5%-95%" = dis_pal_list[2], "25%-75%" = dis_pal_list[2])) +
     scale_color_manual(values = c("Median" = dis_pal_list[2])) +
     labs(
-        title = "Smoothed Quantile Trends",
-        subtitle = sprintf("Across the locations reporting each panel (of %d in total), smoothed window: %s",
-                           n_locations, format(window_size)),
-        x = "Date", y = "Value (smoothed)",
+        title = if (smooth_quantiles) "Smoothed Quantile Trends" else "Quantile Trends",
+        subtitle = sprintf("Across the locations reporting each panel (of %d in total)%s",
+                           n_locations,
+                           if (smooth_quantiles) sprintf(", smoothed window: %s", format(window_size)) else ", as published"),
+        x = "Date", y = if (smooth_quantiles) "Value (smoothed)" else "Value",
         fill = "Range", color = "Trend"
     ) +
     theme(legend.position = "bottom")
 ```
 
+::: {.content-visible when-meta="geo_outliers"}
+
 #### Cross-Sectional Geographic Outliers
 
-While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations sit in either extreme tail — above the cross-sectional 95th percentile, or below the 5th percentile, recorded on that specific date and stratum. Both percentages are shares of the periods the location actually reported, not of the analysis window, and the number of reported values is shown so that a location with only a handful of observations is not read as a stable 100%.
+While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. This table complements them by placing each location within the distribution: it tracks how often a location sits in either extreme tail — above the cross-sectional 95th percentile, or below the 5th percentile, recorded on that specific date and stratum. Both percentages are shares of the periods the location actually reported, not of the analysis window, and the number of reported values is shown so that a location with only a handful of observations is not read as a stable 100%.
+
+How to read it: a location in the tail on roughly 5% of its periods is where chance alone would put it, so the table is about the ones far from 5%. A location above the 95th percentile most of the time is not having a long outbreak — it is sitting at a different level from everyone else, which usually points at its denominator, coverage or coding rather than at epidemiology, and is worth checking against the raw counts. The same holds at the bottom, where a high zero share is the more common symptom. A location that appears in *both* tails is unstable rather than merely high or low.
 
 ::: {.callout-note}
-This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than outliers.
+This approach compares locations against one another on each date, so it only tells you about relative position — never about whether a value is correct. If the `r ind` `r sg_pl("relies", "rely")` on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations; in those cases, this metric reflects size rather than outliers. Set the `show_geo_outliers` parameter to `false` to drop the section.
 :::
 
 ```{r}
 #| label: eda-aberrant-locations
 #| echo: false
 #| results: asis
-#| eval: !expr n_locations > 1
+#| eval: !expr (show_geo_outliers && n_locations > 1)
 strat_cols <- c("signal", params$extra_keys)
 
 # Only reported values take part: a location cannot be in a tail on a period it
@@ -1165,8 +1302,7 @@ if (nrow(aberrant_locs) > 0) {
 }
 ```
 
-
-
+:::
 
 
 :::
@@ -1174,9 +1310,11 @@ if (nrow(aberrant_locs) > 0) {
 
 ::: {.content-visible when-meta="multi_location"}
 
-### Noise Assessment
+### Temporal Variability
 
-We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas. The CV is computed over the values a location actually reported, so missing periods neither contribute nor count against it. One CV is computed per (location, stratum) rather than pooling strata together, because a location's strata usually sit at different levels and pooling them measures between-stratum spread rather than noise.
+We calculate the Coefficient of Variation (CV) for each location to compare how much the `r ind` `r sg_pl("moves", "move")` over time across geographic areas. A high CV is not by itself evidence of noise: real epidemic dynamics, seasonality and genuine level shifts all raise it, so read it as the size of the temporal variation and use the seasonality and revision sections to judge how much of that variation is signal. What it is good for is comparison — a location whose CV is far above its peers is usually the one to inspect first.
+
+The CV is computed over the values a location actually reported, so missing periods neither contribute nor count against it. One CV is computed per (location, stratum) rather than pooling strata together, because a location's strata usually sit at different levels and pooling them measures between-stratum spread rather than variation over time.
 
 A CV is undefined where a location has a mean of zero or fewer than two reported values; those series cannot appear in the histogram, and their number is stated in the caption so the bars can be reconciled against the location count.
 
@@ -1214,7 +1352,10 @@ n_excluded <- nrow(noise_stats) - nrow(noise_stats_plot)
 noise_summary <- noise_stats %>%
     group_by(across(all_of(c("signal", params$extra_keys)))) %>%
     summarize(median_cv = median(cand_cv), n_locs = n_distinct(geo_value), .groups = "drop") %>%
-    mutate(indicator = signal_labels[signal]) %>%
+    mutate(
+        indicator = signal_labels[signal],
+        across(all_of(params$extra_keys), order_strata)
+    ) %>%
     arrange(across(all_of(params$extra_keys))) %>%
     select(indicator, all_of(params$extra_keys), n_locs, median_cv)
 
@@ -1243,7 +1384,7 @@ ggplot(noise_stats_plot, aes(x = cand_cv)) +
     {if (multi_signal || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (multi_signal) "signal_label", params$extra_keys)), scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
     labs(
         title = "CV Distribution by Location",
-        subtitle = "Lower values indicate a more stable indicator",
+        subtitle = "Higher values mean more variation over time, from real dynamics or from noise",
         x = "Coefficient of Variation (CV)", y = "Count"
     ) +
     theme(legend.position = "none")
@@ -1277,14 +1418,21 @@ if (!is.null(candidate_archive) &&
 
 
 
+::: {.content-visible when-meta="versioning"}
+
 ### Candidate Versioning
 
-This section examines how published values change over time as new data arrives. Each observation may be revised multiple times after its initial release, and the statistics below summarize both how often and how much those revisions occur. Relative revisions measure the magnitude of a revision relative to the indicator's own scale. A relative revision of 0.1 means the observation shifted by 10% of its own magnitude across revisions, while values near 1 indicate revisions as large as the indicator itself.
+Versioning is not the focus of this notebook. This section answers only whether the `r ind` `r sg_pl("revises", "revise")` at all and roughly how much, which is enough to decide whether the values above can be read as final. The statistics below summarize how often and how much observations are revised after their initial release. Relative revisions measure the magnitude of a revision relative to the `r ind_poss` own scale: a relative revision of 0.1 means the observation shifted by 10% of its own magnitude across revisions, while values near 1 indicate revisions as large as the `r ind` `r sg_pl("itself", "themselves")`.
+
+::: {.callout-tip}
+For the full treatment — revision lags by location, convergence over time, and how much of the latest value is knowable at each lag — use the dedicated notebook, `revision_analysis/revision_analysis.qmd`, which exists for that purpose.
+:::
 
 ```{r}
 #| label: revision-analysis-text
 #| echo: false
 #| results: asis
+#| eval: !expr show_versioning
 if (is.null(archive)) {
     cat(sprintf(
         "No version history is available for `%s / %s` — versioning analysis is skipped.\n\n",
@@ -1346,9 +1494,6 @@ if (is.null(archive)) {
     }
 
     # Run revision_summary per signal so results are always signal-specific
-    rev_details_list <- list()
-    rev_beh_combined <- NULL
-
     for (sig in signals_vec) {
         if (multi_signal) cat(sprintf("\n#### %s\n\n", signal_labels[sig]))
 
@@ -1360,125 +1505,13 @@ if (is.null(archive)) {
             as_epi_archive()
 
         rd_sig <- revision_summary(sub_archive)
-        rev_details_list[[sig]] <- rd_sig
-
-        # Accumulate combined revision_behavior with signal label
-        rev_beh_combined <- bind_rows(
-            rev_beh_combined,
-            rd_sig$revision_behavior %>% mutate(signal = sig)
-        )
-
         print_rev_stats(rd_sig, sub_archive)
     }
 
-    # Expose rev_details (first signal) for the visuals chunk; inject combined rev_behavior
-    rev_details <- rev_details_list[[signals_vec[1]]]
-    rev_details$revision_behavior <- rev_beh_combined
 }
 ```
 
-```{r}
-#| label: revision-analysis-visuals-text
-#| echo: false
-#| results: asis
-#| eval: !expr (archive_has_history && n_locations > 1)
-cat(sprintf("The time series below visualize the candidate indicator(s) (%s) with line colors corresponding to the issue date, meaning the date the data was initially published or subsequently revised. Darker colors denote older versions, while lighter colors represent more recent updates.\n\n", paste(name_vec, collapse = ", ")))
-cat("If the lines perfectly overlap, it means the data for that location is not subject to revisions. Where you see a vertical spread along a single date on the x-axis, the data has been revised over time.\n\n")
-```
-
-```{r}
-#| label: revision-analysis-visuals
-#| eval: !expr archive_has_history
-#| results: asis
-#| fig-height: !expr min(max(5, length(signals_vec) * 1.5), 12)
-rev_by_loc <- rev_details$revision_behavior %>%
-    filter(n_revisions != 0) %>%
-    group_by(signal, geo_value) %>%
-    summarize(
-        n_versions = n(),
-        n_rev = mean(n_revisions, na.rm = TRUE),
-        min_lag = min(min_lag, na.rm = TRUE),
-        max_lag = max(max_lag, na.rm = TRUE),
-        spread = mean(spread, na.rm = TRUE),
-        rel_spread = mean(rel_spread, na.rm = TRUE),
-        lag_near_latest = mean(lag_near_latest, na.rm = TRUE),
-        .groups = "drop"
-    ) %>%
-    mutate(signal_label = signal_labels[signal]) %>%
-    arrange(desc(rel_spread))
-
-if (nrow(rev_by_loc) > 0) {
-    cat("The table below summarizes revision behavior per location. Column definitions:\n\n")
-    cat("- Min Lag. Minimum days between the event date and its first publication.\n")
-    cat("- Max Lag. Maximum days between the event date and its final revision.\n")
-    cat("- Avg. Spread. Average absolute difference between the minimum and maximum published values.\n")
-    cat("- Avg. Rel. Spread. Average relative difference between the minimum and maximum published values (spread divided by the maximum value).\n")
-    cat(sprintf("- Lag Near Latest. Average days until the value stays within %d%% of the latest published value.\n\n", rev_details$within_latest * 100))
-
-    rev_by_loc_display <- if (multi_signal) {
-        rev_by_loc %>% select(signal_label, geo_value, n_versions:lag_near_latest)
-    } else {
-        rev_by_loc %>% select(geo_value, n_versions:lag_near_latest)
-    }
-    DT::datatable(rev_by_loc_display,
-        colnames = c(
-            if (multi_signal) "Indicator" else NULL,
-            "Location", "Versions", "Avg. Revisions", "Min Lag", "Max Lag",
-            "Avg. Spread", "Avg. Rel. Spread", "Lag Near Latest"
-        ),
-        caption = "Candidate revision behavior by location",
-        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-    ) %>% DT::formatRound(columns = if (multi_signal) 3:9 else 2:8, digits = 2)
-}
-
-if (nrow(rev_by_loc) > 0 && n_locations > 1) {
-    # Pick top locations by max rel_spread across signals
-    rev_geos <- rev_by_loc %>%
-        group_by(geo_value) %>%
-        summarize(rel_spread = max(rel_spread, na.rm = TRUE), .groups = "drop") %>%
-        arrange(desc(rel_spread)) %>%
-        #sample_geos
-        head(params$max_locations_plot) %>%
-        pull(geo_value)
-
-    # Limit to last year for clarity
-    # For multi-signal, loop per signal to avoid autoplot dropdown issues with
-    # the signal other-key (same pattern as eda-overview).
-    archive_filtered <- archive %>%
-        filter(geo_value %in% rev_geos) %>%
-        filter(time_value >= max(time_value) - years(1))
-
-    if (!multi_signal) {
-        n_geos_rev <- n_distinct(archive_filtered$DT$geo_value)
-        autoplot(archive_filtered, .versions = "month",
-            .interactive = TRUE, .facet_to_dropdown = n_geos_rev > 1) %>%
-            plotly::toWebGL() %>%
-            plotly::partial_bundle()
-    } else {
-        rev_plots <- purrr::map(signals_vec, function(sig) {
-            arch_sig_dt <- archive_filtered$DT %>%
-                as_tibble() %>%
-                filter(signal == sig) %>%
-                select(-signal)
-            if (nrow(arch_sig_dt) == 0) return(NULL)
-            arch_sig <- as_epi_archive(arch_sig_dt)
-            n_geos_sig <- n_distinct(arch_sig$DT$geo_value)
-            p <- autoplot(arch_sig, .versions = "month",
-                .interactive = TRUE, .facet_to_dropdown = n_geos_sig > 1) %>%
-                plotly::toWebGL() %>%
-                plotly::partial_bundle()
-            htmltools::tagList(
-                htmltools::tags$h5(signal_labels[sig]),
-                p
-            )
-        }) %>%
-            purrr::compact()
-        htmltools::tagList(rev_plots)
-    }
-}
-```
-
-
+:::
 
 
 
@@ -1486,14 +1519,14 @@ if (nrow(rev_by_loc) > 0 && n_locations > 1) {
 
 This section is by its nature more difficult than others to do systematically. Things to look for:
 
-- Do the values you see match the values you expected to see? This is the check that catches the most, and only you can make it: state the range, level and shape you expected from the indicator's definition before reading the plots, then compare.
+- Do the values you see match the values you expected to see? This is the check that catches the most, and only you can make it: state the range, level and shape you expected from the `r ind_poss` definition before reading the plots, then compare.
 - If it's a percentage or percentile, is it between 0 and 100?
 - If it's a count, is it roughly proportional to the population of each location? A count that does not scale with population points at a coverage or denominator problem. A rate or percentage is already normalized, so the level should instead be roughly comparable across locations of very different sizes, and a location whose level is far off the rest is worth investigating. Note that the relevant denominator is usually not the whole resident population but the part of it the source observes (for example, the patients of one healthcare system). *(requires external population data — inspect manually)*
 - Are the actual values reasonable? E.g. if it's a percentage, does it ever approach 100 outside of literal pandemics?
 - If it's for a seasonal disease, are rates highest in the winter and lowest in the summer?
 - Are geo-aggregated coarser levels plausible aggregations? *(checked below for state-level indicators vs HHS/nation)*
 
-The histogram and table below show the distribution of all observed values and the value range per location for the candidate indicator, to assess whether the range is plausible given the indicator's expected scale.
+The `r sg_pl("histogram", "histograms")` and table below show the distribution of all observed values and the value range per location for the candidate `r ind`, to assess whether the range is plausible given the `r ind_poss` expected scale.
 
 ```{r}
 #| label: sanity-value-range
@@ -1510,7 +1543,7 @@ ggplot(df_candidate_plot, aes(x = value)) +
         title = if (multi_signal) "Value distribution by indicator"
                 else sprintf("Value distribution: %s", signal_labels[signals_vec]),
         subtitle = sprintf(
-            "%s observations across %d locations",
+            "%s reported values across %d locations",
             label_comma()(nrow(df_candidate)), n_locations
         ),
         x = "Value", y = "Count"
@@ -1559,7 +1592,7 @@ DT::datatable(
 ) %>% DT::formatRound(columns = which(names(range_tbl) %in% c("min", "p05", "median", "p95", "max")), digits = 3)
 ```
 
-The plot below shows the seasonal pattern of the indicator, with each panel representing one epidemiological year (`r season_label`). That boundary is set by the `season_start_month` parameter; it defaults to July so that a northern-hemisphere respiratory season falls inside a single panel, following the usual influenza convention. Set it to another month for indicators whose season peaks elsewhere in the year. The line traces the monthly median across all locations, the inner band covers the interquartile range, and the outer band spans the full observed range.
+The plot below shows the seasonal pattern of the `r ind`, with each panel representing one epidemiological year (`r season_label`). That boundary is set by the `season_start_month` parameter; it defaults to July so that a northern-hemisphere respiratory season falls inside a single panel, following the usual influenza convention. Set it to another month for indicators whose season peaks elsewhere in the year. The line traces the monthly median across all locations, the inner band covers the 25th-75th percentile range (the middle 50% of observations that month), and the outer band spans the full observed range, from the lowest to the highest value.
 
 ```{r}
 #| label: sanity-seasonality
@@ -1603,7 +1636,7 @@ ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group =
     labs(
         title = if (multi_signal) "Seasonal patterns by indicator"
                 else sprintf("Seasonal pattern: %s", signal_labels[signals_vec]),
-        subtitle = "Median by month across all locations — inner band: IQR, outer band: full range",
+        subtitle = "Median by month across all locations — inner band: 25th-75th pct, outer band: min-max",
         x = "Month", y = "Median value"
     ) +
     theme(legend.position = "none")
