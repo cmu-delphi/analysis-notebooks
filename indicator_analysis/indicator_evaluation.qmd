@@ -20,6 +20,8 @@ params:
   time_type:
   start_day:
   end_day:
+  # Extra key columns beyond geo_value/time_value (character vector), e.g. "age_group"
+  extra_keys: !expr "character(0)"
   # Maximum locations to show in plots/tables
   max_locations_plot: 60
   max_archive_locs: 60
@@ -368,13 +370,13 @@ if (!is.null(params$input_csv)) {
             } %>%
             mutate(version = as.Date(version))
         csv_archive_df  <- df_candidate_raw %>%
-            select(geo_value, time_value, version, any_of("signal"), value) %>%
-            group_by(geo_value, time_value, version, pick(any_of("signal"))) %>%
+            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys), value) %>%
+            group_by(geo_value, time_value, version, pick(any_of(c("signal", params$extra_keys)))) %>%
             slice_max(value, n = 1, with_ties = FALSE) %>%
             ungroup()
 
         candidate_archive <- csv_archive_df %>%
-            as_epi_archive(signal_format = "long")
+            as_epi_archive(signal_format = "as_is", other_keys = params$extra_keys)
         df_candidate <- epix_as_of(candidate_archive, candidate_archive$versions_end)
         cat(sprintf(
             "- CSV contains version history: %s versions\n",
@@ -382,7 +384,7 @@ if (!is.null(params$input_csv)) {
         ))
     } else {
         df_candidate <- df_candidate_raw %>%
-            as_epi_df(signal_format = "long")
+            as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
     }
 } else {
     # Determine if new API can be used for candidate source
@@ -423,10 +425,10 @@ if (!is.null(params$input_csv)) {
                     time_value >= as.Date(params$start_day),
                     time_value <= as.Date(params$end_day)
                 ) %>%
-                select(geo_value, any_of("signal"), time_value, value)
+                select(geo_value, any_of("signal"), time_value, any_of(params$extra_keys), value)
         }) %>%
             bind_rows() %>%
-            as_epi_df(signal_format = "long")
+            as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
     } else {
         # pub_covidcast accepts a signal vector and returns a signal column
         df_candidate <- pub_covidcast(
@@ -434,7 +436,7 @@ if (!is.null(params$input_csv)) {
             params$geo_type, params$time_type,
             time_values = time_range(params$start_day, params$end_day),
             as_of = Sys.Date()
-        ) %>% as_epi_df(signal_format = "long")
+        ) %>% as_epi_df(signal_format = "as_is", other_keys = params$extra_keys)
     }
 }
 
@@ -514,7 +516,7 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
         df_archive_raw <- df_archive_raw %>%
             rename(any_of(c(time_value = "reference_time", version = "issue"))) %>%
             rename(any_of(c(version = "report_time"))) %>%
-            select(geo_value, time_value, version, any_of("signal"), value) #%>%
+            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys), value) #%>%
             # Deduplicate: sources like NWSS can have multiple rows per
             # (geo, time, version) from different measurement sources.
             # group_by(geo_value, time_value, version, across(any_of("signal"))) %>%
@@ -525,7 +527,7 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
             archive_info$version_start <- min(df_archive_raw$version)
             archive_info$version_end <- max(df_archive_raw$version)
             candidate_archive <- df_archive_raw %>%
-                as_epi_archive(signal_format = "long")
+                as_epi_archive(signal_format = "as_is", other_keys = params$extra_keys)
         }
     }
 }
@@ -546,6 +548,14 @@ if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo
 }
 
 n_locations <- n_distinct(df_candidate$geo_value)
+
+# Number of extra-key combinations (e.g. age groups) present; 1 when no extra keys.
+# Plots that facet by signal x extra-key scale their height by this.
+n_key_combos <- if (length(params$extra_keys) > 0) {
+    df_candidate %>% as_tibble() %>% distinct(across(all_of(params$extra_keys))) %>% nrow()
+} else {
+    1L
+}
 ```
 
 ```{r}
@@ -595,20 +605,20 @@ By observing the width of these ribbons, you can get a sense of geographic varia
 
 ```{r}
 #| label: eda-quantiles
-#| fig-height: !expr min(max(5, length(signals_vec)*1.5), 15)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 1.5), 15)
 #| eval: !expr n_locations > 1
 cat("\n")
 
 # Aggregate location values per (signal, time_value); use signal name as geo_value
 # so epi_slide partitions by signal automatically.
 df_quantiles_wide <- df_candidate %>%
-    group_by(signal, time_value) %>%
+    group_by(across(all_of(c("signal", "time_value", params$extra_keys)))) %>%
     summarize(
-        vals = list(value), 
+        vals = list(value),
         geo_value = "all",
         .groups = "drop"
     ) %>%
-    as_epi_df(signal_format = "long")
+    as_epi_df(signal_format = "as_is", other_keys = c("signal", params$extra_keys))
 
 # Handle time frequency differences for .window_size.
 window_size <- switch(env_time_type %||% "unknown",
@@ -621,7 +631,7 @@ window_size <- switch(env_time_type %||% "unknown",
 )
 
 df_quantiles_wide <- df_quantiles_wide %>%
-    group_by(geo_value, signal) %>%
+    group_by(across(all_of(c("geo_value", "signal", params$extra_keys)))) %>%
     epi_slide(
         ~ tibble(
             `0.05` = quantile(unlist(.x$vals), 0.05, na.rm = TRUE),
@@ -639,7 +649,7 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
     geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
     geom_ribbon(aes(ymin = `0.25`, ymax = `0.75`, fill = "25%-75%"), alpha = 0.4) +
     geom_line(aes(y = `0.5`, color = "Median"), linewidth = 1) +
-    facet_wrap(~indicator, ncol = 1, scales = "free_y") +
+    facet_wrap(reformulate(c("indicator", params$extra_keys)), ncol = 1, scales = "free_y") +
     scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
     scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_si(""))) +
     scale_fill_manual(values = c("5%-95%" = dis_pal_list[2], "25%-75%" = dis_pal_list[2])) +
@@ -728,10 +738,10 @@ This section explores the availability of data across time and space. The area c
 #| echo: false
 #| results: asis
 coverage <- df_candidate %>%
-    group_by(signal, time_value) %>%
+    group_by(across(all_of(c("signal", "time_value", params$extra_keys)))) %>%
     summarize(n_available = sum(!is.na(value)), .groups = "drop") %>%
     mutate(geo_value = "all") %>%
-    as_epi_df(signal_format = "long")
+    as_epi_df(signal_format = "as_is", other_keys = c("signal", params$extra_keys))
 
 # Determine smoothing window based on time type
 slide_window <- switch(env_time_type %||% "unknown",
@@ -743,7 +753,7 @@ slide_window <- switch(env_time_type %||% "unknown",
 
 if (env_time_type != params$time_type &&slide_window > 1) {
     coverage <- coverage %>%
-        group_by(geo_value, signal) %>%
+        group_by(across(all_of(c("geo_value", "signal", params$extra_keys)))) %>%
         epi_slide(
             n_available_smooth = mean(n_available, na.rm = TRUE),
             .window_size = slide_window
@@ -758,7 +768,7 @@ coverage <- coverage %>%
 
 ```{r}
 #| label: eda-coverage-plot
-#| fig-height: !expr min(max(5, length(signals_vec)*2), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2), 12)
 #| echo: true
 ggplot(coverage, aes(x = time_value, y = n_available,
                      color = indicator, linetype = indicator)) +
@@ -772,7 +782,7 @@ ggplot(coverage, aes(x = time_value, y = n_available,
         x = "Date", y = "Number of locations",
         color = "Indicator", linetype = "Indicator"
     ) +
-    {if (length(signals_vec) > 6) facet_wrap(~indicator, ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
+    {if (length(signals_vec) > 6 || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (length(signals_vec) > 6) "indicator", params$extra_keys)), ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
 ```
 
 
@@ -901,7 +911,7 @@ $$\text{CV}_i = \frac{\text{SD}(X_i)}{|\bar{X}_i|}$$
 
 ```{r}
 #| label: eda-noise
-#| fig-height: !expr min(max(5, length(signals_vec)*0.5), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * 0.5), 12)
 #| eval: !expr n_locations > 1
 # Calculate CV per (signal, location)
 noise_stats <- df_candidate %>%
@@ -1090,7 +1100,7 @@ cat("If the lines perfectly overlap, it means the data for that location is not 
 #| label: revision-analysis-visuals
 #| eval: !expr archive_has_history
 #| results: asis
-#| fig-height: !expr min(max(5, length(signals_vec)*1.5), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * 1.5), 12)
 rev_by_loc <- rev_details$revision_behavior %>%
     filter(n_revisions != 0) %>%
     group_by(signal, geo_value) %>%
@@ -1196,7 +1206,7 @@ The histogram and table below show the distribution of all observed values and t
 
 ```{r}
 #| label: sanity-value-range
-#| fig-height: !expr min(max(5, length(signals_vec)*0.5), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * 0.5), 12)
 df_candidate_plot <- df_candidate %>%
     mutate(indicator = signal_labels[signal])
 
@@ -1259,7 +1269,7 @@ The plot below shows the seasonal pattern of the indicator, with each panel repr
 
 ```{r}
 #| label: sanity-seasonality
-#| fig-height: !expr min(max(5, length(signals_vec)*2.5), 15)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2.5), 15)
 #| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
 
 season_month_labels <- function(x) {
@@ -1274,7 +1284,7 @@ df_seasonal <- df_candidate %>%
         season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
         season_month = if_else(month >= 6L, month - 5L, month + 7L)
     ) %>%
-    group_by(signal, season, season_month) %>%
+    group_by(signal, season, season_month, across(all_of(params$extra_keys))) %>%
     summarize(
         median_val = median(value, na.rm = TRUE),
         min_val = min(value, na.rm = TRUE),
@@ -1283,10 +1293,10 @@ df_seasonal <- df_candidate %>%
         p75 = quantile(value, 0.75, na.rm = TRUE),
         .groups = "drop"
     ) %>%
-    # Keep only signal-season combos with >= 3 months of data
+    # Keep only signal-season (x extra-key) combos with >= 3 months of data
     semi_join(
-        count(., signal, season) %>% filter(n >= 3),
-        by = c("signal", "season")
+        count(., across(all_of(c("signal", "season", params$extra_keys)))) %>% filter(n >= 3),
+        by = c("signal", "season", params$extra_keys)
     ) %>%
     mutate(signal_label = signal_labels[signal])
 
@@ -1296,8 +1306,12 @@ ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group =
     geom_line(aes(y = median_val), linewidth = 0.8) +
     geom_point(aes(y = median_val), size = 1.5) +
     {
-        if (multi_signal) facet_grid(signal_label ~ season, scales = "free_y")
-        else facet_wrap(~season, ncol = 2, scales = "free_y")
+        row_vars <- c(if (multi_signal) "signal_label", params$extra_keys)
+        if (length(row_vars) > 0) {
+            facet_grid(as.formula(paste(paste(row_vars, collapse = " + "), "~ season")), scales = "free_y")
+        } else {
+            facet_wrap(~season, ncol = 2, scales = "free_y")
+        }
     } +
     scale_x_continuous(labels = season_month_labels) +
     scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
