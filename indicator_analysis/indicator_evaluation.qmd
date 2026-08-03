@@ -1176,52 +1176,71 @@ if (nrow(aberrant_locs) > 0) {
 
 ### Noise Assessment
 
-We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas.
+We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas. The CV is computed over the values a location actually reported, so missing periods neither contribute nor count against it. One CV is computed per (location, stratum) rather than pooling strata together, because a location's strata usually sit at different levels and pooling them measures between-stratum spread rather than noise.
+
+A CV is undefined where a location has a mean of zero or fewer than two reported values; those series cannot appear in the histogram, and their number is stated in the caption so the bars can be reconciled against the location count.
 
 $$\text{CV}_i = \frac{\text{SD}(X_i)}{|\bar{X}_i|}$$
 
 ```{r}
 #| label: eda-noise
-#| fig-height: !expr min(max(5, length(signals_vec) * 0.5), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 0.8), 12)
 #| eval: !expr n_locations > 1
-# Calculate CV per (signal, location)
+# One CV per (indicator, stratum, location), over reported values only
 noise_stats <- df_candidate %>%
-    arrange(signal, geo_value, time_value) %>%
-    group_by(signal, geo_value) %>%
+    as_tibble() %>%
+    filter(!is.na(value)) %>%
+    group_by(across(all_of(c("signal", params$extra_keys, "geo_value")))) %>%
     summarize(
-        cand_cv = sd(value, na.rm = TRUE) / abs(mean(value, na.rm = TRUE)),
+        n_obs = n(),
+        cand_cv = sd(value) / abs(mean(value)),
         .groups = "drop"
-    ) %>%
-    filter(is.finite(cand_cv))
+    )
+
+n_series <- nrow(noise_stats)
+noise_undefined <- noise_stats %>% filter(!is.finite(cand_cv))
+noise_stats <- noise_stats %>% filter(is.finite(cand_cv))
 
 # Clip extreme outliers for robust visualization
 cv_upper <- quantile(noise_stats$cand_cv, 0.99, na.rm = TRUE)
 noise_stats_plot <- noise_stats %>%
     filter(cand_cv <= cv_upper) %>%
-    mutate(signal_label = signal_labels[signal])
+    mutate(signal_label = signal_labels[signal]) %>%
+    label_strata_coverage(params$extra_keys, src = df_candidate)
 
 n_excluded <- nrow(noise_stats) - nrow(noise_stats_plot)
 
-# Summary Table — one row per signal
+# Summary Table — one row per (indicator, stratum)
 noise_summary <- noise_stats %>%
-    group_by(signal) %>%
-    summarize(`Median CV` = median(cand_cv), .groups = "drop") %>%
-    mutate(Signal = signal_labels[signal]) %>%
-    select(Signal, `Median CV`)
+    group_by(across(all_of(c("signal", params$extra_keys)))) %>%
+    summarize(median_cv = median(cand_cv), n_locs = n_distinct(geo_value), .groups = "drop") %>%
+    mutate(indicator = signal_labels[signal]) %>%
+    arrange(across(all_of(params$extra_keys))) %>%
+    select(indicator, all_of(params$extra_keys), n_locs, median_cv)
 
 DT::datatable(noise_summary,
-    caption = sprintf(
-        "CV summary across locations.%s",
-        if (n_excluded > 0) sprintf(" (%d extreme outlier(s) excluded from plot.)", n_excluded) else ""
+    colnames = c(
+        "Indicator",
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+        "Locations", "Median CV"
     ),
-    rownames = FALSE, options = list(scrollX = TRUE, paging = FALSE, dom = "t")
-) %>% DT::formatRound(columns = 2, digits = 3)
+    caption = sprintf(
+        "CV summary across locations. %d of %d (location%s) series have a defined CV%s%s.",
+        nrow(noise_stats), n_series,
+        if (length(params$extra_keys) > 0) " x stratum" else "",
+        if (nrow(noise_undefined) > 0) {
+            sprintf("; %d dropped as undefined (zero mean or a single reported value)", nrow(noise_undefined))
+        } else "",
+        if (n_excluded > 0) sprintf("; a further %d above the 99th percentile are excluded from the plot", n_excluded) else ""
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+) %>% DT::formatRound(columns = ncol(noise_summary), digits = 3)
 
-# Histogram (faceted by signal when multi_signal)
+# Histogram (faceted by indicator x stratum)
 ggplot(noise_stats_plot, aes(x = cand_cv)) +
     geom_histogram(bins = 30, color = "white", fill = dis_pal_list[2], alpha = 0.7) +
     scale_x_continuous(labels = label_percent()) +
-    {if (multi_signal) facet_wrap(~signal_label, scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
+    {if (multi_signal || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (multi_signal) "signal_label", params$extra_keys)), scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
     labs(
         title = "CV Distribution by Location",
         subtitle = "Lower values indicate a more stable indicator",
