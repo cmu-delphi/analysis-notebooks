@@ -1144,7 +1144,7 @@ if (multi_signal) htmltools::tagList(overview_plots) else overview_plots[[1]]
 
 By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the `r ind`.
 
-Each quantile is taken cross whichever locations reported a value in that window, so panels whose location counts differ (shown in each panel label) are not directly comparable. A spike confined to one panel is often a composition effect: a location that reports only the aggregate stratum, on a small denominator, can move that panel's upper quantile without appearing in any other panel.
+Each quantile is taken across whichever locations reported a value in that window, so panels whose location counts differ (shown in each panel label) are not directly comparable. A spike confined to one panel is often a composition effect: a location that reports only the aggregate stratum, on a small denominator, can move that panel's upper quantile without appearing in any other panel.
 
 ```{r}
 #| label: eda-quantiles
