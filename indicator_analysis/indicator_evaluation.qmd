@@ -1087,7 +1087,7 @@ ggplot(df_quantiles_wide, aes(x = time_value)) +
 
 #### Cross-Sectional Geographic Outliers
 
-While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the cross-sectional 95th percentile recorded on that specific date).
+While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations sit in either extreme tail — above the cross-sectional 95th percentile, or below the 5th percentile, recorded on that specific date and stratum. Both percentages are shares of the periods the location actually reported, not of the analysis window, and the number of reported values is shown so that a location with only a handful of observations is not read as a stable 100%.
 
 ::: {.callout-note}
 This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than outliers.
@@ -1098,47 +1098,68 @@ This approach compares locations against one another on each date. If the indica
 #| echo: false
 #| results: asis
 #| eval: !expr n_locations > 1
-# Calculate daily 95th percentiles per signal
-daily_p95 <- df_candidate %>%
-    group_by(signal, time_value) %>%
+strat_cols <- c("signal", params$extra_keys)
+
+# Only reported values take part: a location cannot be in a tail on a period it
+# never reported, and it should not be charged for one either.
+df_reported <- df_candidate %>%
+    as_tibble() %>%
+    filter(!is.na(value))
+
+# A non-negative indicator makes the share of exact zeros worth reporting
+# alongside the lower tail, since the 5th percentile is often zero itself.
+show_zero_share <- all(df_reported$value >= 0)
+
+# Cross-sectional tails per (indicator, stratum, period)
+daily_tails <- df_reported %>%
+    group_by(across(all_of(c(strat_cols, "time_value")))) %>%
     summarize(
-        cand_p95 = quantile(value, 0.95, na.rm = TRUE),
+        cand_p05 = quantile(value, 0.05),
+        cand_p95 = quantile(value, 0.95),
         .groups = "drop"
     )
 
-# Find how often each location exceeds the 95th percentile, per signal
-aberrant_locs <- df_candidate %>%
-    left_join(daily_p95, by = c("signal", "time_value")) %>%
-    group_by(signal, geo_value) %>%
+aberrant_locs <- df_reported %>%
+    left_join(daily_tails, by = c(strat_cols, "time_value")) %>%
+    group_by(across(all_of(c(strat_cols, "geo_value")))) %>%
     summarize(
-        n_days = n(),
-        cand_aberrant_days = sum(value > cand_p95, na.rm = TRUE),
-        cand_aberrant_pct = (cand_aberrant_days / n_days) * 100,
+        n_obs = n(),
+        upper_pct = 100 * mean(value > cand_p95),
+        lower_pct = 100 * mean(value < cand_p05),
+        zero_pct  = 100 * mean(value == 0),
         .groups = "drop"
     ) %>%
     mutate(
         geo_name     = geo_to_name(geo_value),
         signal_label = signal_labels[signal]
     ) %>%
-    arrange(desc(cand_aberrant_pct))
+    arrange(desc(upper_pct))
 
 if (nrow(aberrant_locs) > 0) {
-    aberrant_display <- if (multi_signal) {
-        aberrant_locs %>% select(signal_label, geo_value, geo_name, cand_aberrant_pct)
-    } else {
-        aberrant_locs %>% select(geo_value, geo_name, cand_aberrant_pct)
-    }
+    aberrant_display <- aberrant_locs %>%
+        select(
+            any_of(if (multi_signal) "signal_label" else character(0)),
+            all_of(params$extra_keys), geo_value, geo_name, n_obs,
+            upper_pct, lower_pct, any_of(if (show_zero_share) "zero_pct" else character(0))
+        )
     DT::datatable(
         aberrant_display,
         colnames = c(
-            if (multi_signal) "Signal" else NULL,
+            if (multi_signal) "Indicator" else NULL,
+            str_to_title(str_replace_all(params$extra_keys, "_", " ")),
             "Geo-level",
             "Name",
-            "% Time Above 95th (candidate)"
+            "Values Reported",
+            "% Above 95th",
+            "% Below 5th",
+            if (show_zero_share) "% Exactly Zero" else NULL
         ),
-        caption = "Summary of aberrant locations (time spent in the upper tail).",
+        caption = "Summary of aberrant locations (time spent in each tail, as a share of the periods the location reported).",
         rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-    ) %>% DT::formatRound(columns = if (multi_signal) 4 else 3, digits = 1)
+    ) %>% DT::formatRound(
+        columns = which(names(aberrant_display) %in% c("upper_pct", "lower_pct", "zero_pct")),
+        digits = 1
+    )
 } else {
     cat("Insufficient data to calculate aberrant time for these locations.\n\n")
 }
