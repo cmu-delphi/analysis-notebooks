@@ -1,7 +1,7 @@
 [
   {
-    "objectID": "indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
-    "href": "indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
+    "objectID": "vignettes/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
+    "href": "vignettes/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html",
     "title": "Doctor Visits (County) Indicator Analysis",
     "section": "",
     "text": "This page provides access to the exploratory data analysis and comparative evaluation reports for doctor visits indicators.\n\n\n Candidate EDA\nEvaluation of the Doctor Visits: Smoothed Adj CLI signal.\n\n View Candidate EDA Report\nExploratory analysis of the candidate indicator’s spatial and temporal coverage, missingness, and data distributions across US counties.\n\n\n\n County Comparison\nComparison against the JHU COVID-19 Cases guiding indicator.\n\n View JHU Cases Comparison Report\nDetailed comparative analysis assessing correlations, lead/lag relationships, and back-revision behavior against JHU Cases data."
@@ -28,8 +28,8 @@
     "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
   },
   {
-    "objectID": "indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html",
-    "href": "indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html",
+    "objectID": "vignettes/eval_hhs_vs_doctor_visits_api_state.html",
+    "href": "vignettes/eval_hhs_vs_doctor_visits_api_state.html",
     "title": "Doctor Visits (HHS) Indicator Analysis",
     "section": "",
     "text": "This page provides access to the exploratory data analysis and comparative evaluation reports for doctor visits indicators.\n\n\n Candidate EDA\nEvaluation of the Doctor Visits: Smoothed Adj CLI signal.\n\n View Candidate EDA Report\nExploratory analysis of the candidate indicator’s spatial and temporal coverage, missingness, and data distributions across US states.\n\n\n\n HHS Comparison\nComparison against the COVID Hospital Admissions (HHS) guiding indicator.\n\n View HHS Comparison Report\nDetailed comparative analysis assessing correlations, lead/lag relationships, and back-revision behavior against HHS admissions data."

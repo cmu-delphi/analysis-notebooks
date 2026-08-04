@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://cmu-delphi.github.io/analysis-notebooks/indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html</loc>
-    <lastmod>2026-06-15T22:23:17.348Z</lastmod>
+    <loc>https://cmu-delphi.github.io/analysis-notebooks/vignettes/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html</loc>
+    <lastmod>2026-07-28T14:20:32.677Z</lastmod>
   </url>
   <url>
     <loc>https://cmu-delphi.github.io/analysis-notebooks/index.html</loc>
-    <lastmod>2026-06-15T22:20:49.845Z</lastmod>
+    <lastmod>2026-08-04T08:18:31.329Z</lastmod>
   </url>
   <url>
-    <loc>https://cmu-delphi.github.io/analysis-notebooks/indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html</loc>
-    <lastmod>2026-06-15T22:23:24.043Z</lastmod>
+    <loc>https://cmu-delphi.github.io/analysis-notebooks/vignettes/eval_hhs_vs_doctor_visits_api_state.html</loc>
+    <lastmod>2026-07-28T14:20:32.677Z</lastmod>
   </url>
 </urlset>
