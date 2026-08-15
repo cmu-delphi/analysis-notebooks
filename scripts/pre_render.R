@@ -118,3 +118,30 @@ if (!file.exists(out_rev_state)) {
 } else {
   message("Skipping existing report: revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html")
 }
+
+# 6. Nickel: Diarrhea Care-Setting Signals (ED / IP / OP)
+nickel_outputs <- here::here("examples", "nickel", c("eval_diarrhea_ed.html", "eval_diarrhea_ip.html", "eval_diarrhea_op.html"))
+if (!all(file.exists(nickel_outputs))) {
+  message("Generating missing Nickel diarrhea reports")
+  source(here::here("examples", "nickel", "nickel_statistical_analysis.R"))
+} else {
+  message("Skipping existing Nickel diarrhea reports")
+}
+
+# 7. Sleep Cycle: Combined Cough Signals (State & County)
+sleepcycle_outputs <- here::here("examples", "sleepcycle", c("sleepcycle_all_state.html", "sleepcycle_all_county.html"))
+if (!all(file.exists(sleepcycle_outputs))) {
+  message("Generating missing Sleep Cycle cough signal reports")
+  source(here::here("examples", "sleepcycle", "sleepcycle-analysis.R"))
+} else {
+  message("Skipping existing Sleep Cycle cough signal reports")
+}
+
+# 8. VA: COVID Cases/100k (State & MSA)
+va_outputs <- here::here("examples", "va", c("state_ci.html", "msa_ci.html"))
+if (!all(file.exists(va_outputs))) {
+  message("Generating missing VA COVID Cases/100k reports")
+  source(here::here("examples", "va", "va-analysis.R"))
+} else {
+  message("Skipping existing VA COVID Cases/100k reports")
+}

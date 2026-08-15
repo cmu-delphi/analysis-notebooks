@@ -12,6 +12,13 @@ project:
     - "indicator_analysis/eval_doctor_visits_smoothed_adj_cli_api_state.html"
     - "indicator_analysis/eval_jhu_csse_vs_doctor_visits_api_county.html"
     - "indicator_analysis/eval_doctor_visits_smoothed_adj_cli_api_county.html"
+    - "examples/nickel/eval_diarrhea_ed.html"
+    - "examples/nickel/eval_diarrhea_ip.html"
+    - "examples/nickel/eval_diarrhea_op.html"
+    - "examples/sleepcycle/sleepcycle_all_state.html"
+    - "examples/sleepcycle/sleepcycle_all_county.html"
+    - "examples/va/state_ci.html"
+    - "examples/va/msa_ci.html"
     - "revision_analysis/revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html"
     - "dataset_comparison/dataset_comparison_dv.html"
 
@@ -32,6 +39,20 @@ website:
             href: indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html
           - text: "State: HHS vs Dr. Visits"
             href: indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html
+          - text: "Diarrhea: Emergency Department Visits"
+            href: examples/nickel/eval_diarrhea_ed.html
+          - text: "Diarrhea: Inpatient Visits"
+            href: examples/nickel/eval_diarrhea_ip.html
+          - text: "Diarrhea: Outpatient Visits"
+            href: examples/nickel/eval_diarrhea_op.html
+          - text: "State: Sleep Cycle Cough Signals"
+            href: examples/sleepcycle/sleepcycle_all_state.html
+          - text: "County: Sleep Cycle Cough Signals"
+            href: examples/sleepcycle/sleepcycle_all_county.html
+          - text: "State: VA COVID Cases/100k"
+            href: examples/va/state_ci.html
+          - text: "MSA: VA COVID Cases/100k"
+            href: examples/va/msa_ci.html
       - text: Revisions
         menu:
           - text: "State: COVID-19 Hospital Admissions"
