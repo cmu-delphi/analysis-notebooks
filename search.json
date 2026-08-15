@@ -9,21 +9,21 @@
   {
     "objectID": "index.html",
     "href": "index.html",
-    "title": "Rapid SCAN (Tentative Name)",
+    "title": "Rapid SCAN",
     "section": "",
-    "text": "This repository (tentatively called Rapid SCAN, where SCAN stands for Surveillance Comparison and iNformation) hosts a collection of notebooks and reports for epidemiological analysis."
+    "text": "This repository hosts a collection of notebooks and reports for epidemiological analysis."
   },
   {
     "objectID": "index.html#indicator-evaluation",
     "href": "index.html#indicator-evaluation",
-    "title": "Rapid SCAN (Tentative Name)",
+    "title": "Rapid SCAN",
     "section": "Indicator Evaluation",
     "text": "Indicator Evaluation\n\nHHS vs. Doctor Visits (State)\nConfirmed Incidence vs. Doctor Visits (County)"
   },
   {
     "objectID": "index.html#revision-analysis",
     "href": "index.html#revision-analysis",
-    "title": "Rapid SCAN (Tentative Name)",
+    "title": "Rapid SCAN",
     "section": "Revision Analysis",
     "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
   },
