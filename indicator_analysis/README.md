@@ -155,15 +155,21 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | --- | --- | --- | --- |
 | `source` | Candidate indicator data source | — | Required for API; optional label override for CSV |
 | `signal` | Candidate indicator signal name (or vector of signals from the same source) | — | Required for API; optional label override for CSV |
-| `input_csv` | Path to local candidate CSV | `NULL` | Required for CSV |
 | `name` | Display label for candidate indicator | Signal name | Optional |
-| `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | `"state"` | Required for API; automatically inferred for CSV |
-| `time_type` | Time resolution (`day`, `week`, `month`) | `NULL` (inferred from metadata) | Required for legacy API; automatically inferred for CSV/V5 |
+| `input_csv` | Path to local candidate CSV | `NULL` | Required for CSV |
+| `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | — | Required for API; inferred from CSV metadata |
+| `time_type` | Time resolution (`day`, `week`, `month`) | Inferred from metadata, else `"day"` | Required for legacy API; automatically inferred for CSV/V5 |
 | `start_day` | Start date (YYYY-MM-DD) | 2 years before `end_day` | Optional |
 | `end_day` | End date (YYYY-MM-DD) | Today | Optional |
+| `extra_keys` | Extra key columns beyond `geo_value`/`time_value` for stratification | - | Optional |
+| `season_start_month` | First month of the epidemiological year for the seasonality panels (7 = Jul–Jun, the flu convention) | `7` | Optional |
+| `smooth_quantiles` | Smooth the quantile trends with a moving average | `TRUE` | Optional |
+| `show_geo_outliers` | Show the cross-sectional geographic outlier table | `TRUE` | Optional |
+| `show_versioning` | Show the candidate versioning summary (off also skips the version-history fetch, the slowest query) | `TRUE` | Optional |
 | `max_locations_plot` | Max locations in faceted plots | `60` | Optional |
 | `max_archive_locs` | Max locations for version history | `60` | Optional |
-| `min_archive_days` | Min days of history for revision analysis | `60` | Optional |
+| `min_archive_days` | Min days of version history to enable revision analysis | `60` | Optional |
+| `ci_band_limit_mult` | Drop a confidence band wider than this × the value range from the location dropdown plot; raise (e.g. `Inf`) to always draw | `1` | Optional |
 
 ### Parameters for `indicator_analysis/indicator_correlation.qmd`
 
@@ -207,9 +213,11 @@ CSV files must include the following columns:
 | `value` | The indicator value (numeric) | `12.4` |
 | `signal` | (Optional, for multiple signals) The signal identifier | `pct_ed_visits_covid` |
 | `version` | (Optional) Issue/version date for revision analysis (can also be named `issue`) | `2023-01-05` |
+| `ci_lower`, `ci_upper` | (Optional) Confidence bounds, carried along for the overview plot's bands | `10.1`, `14.7` |
+| *(`extra_keys` columns)* | (Optional) Additional stratification columns named via the `extra_keys` param | `age_group` |
 
 > [!NOTE]
-> Including a `version` (or `issue`) column automatically enables the **Revision Behavior** analysis.
+> Including a `version` (or `issue`) column automatically enables the **Candidate Versioning** analysis.
 
 ### Running with Local Data Examples
 
@@ -219,7 +227,7 @@ Minimal evaluation run (labels inferred from CSV name):
 quarto::quarto_render(
   "indicator_analysis/indicator_evaluation.qmd",
   execute_params = list(
-    input_csv = "data/candidate.csv"
+    input_csv = "indicator_analysis/data/candidate.csv"
   )
 )
 ```
@@ -243,8 +251,8 @@ Minimal comparison run:
 quarto::quarto_render(
   "indicator_analysis/indicator_correlation.qmd",
   execute_params = list(
-    guiding_csv = "data/guiding.csv",
-    candidate_csv = "data/candidate.csv"
+    guiding_csv = "indicator_analysis/data/guiding.csv",
+    candidate_csv = "indicator_analysis/data/candidate.csv"
   )
 )
 ```
