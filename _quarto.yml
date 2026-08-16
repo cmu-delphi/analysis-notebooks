@@ -9,6 +9,7 @@ project:
     - vignettes/eval_confirmed_incidence_num_vs_doctor_visits_api_county.qmd
   resources:
     - "indicator_analysis/comp_hhs_vs_doctor_visits_api_state.html"
+    - "indicator_analysis/indicator_multi_comparison.html"
     - "indicator_analysis/eval_doctor_visits_smoothed_adj_cli_api_state.html"
     - "indicator_analysis/eval_jhu_csse_vs_doctor_visits_api_county.html"
     - "indicator_analysis/eval_doctor_visits_smoothed_adj_cli_api_county.html"
@@ -37,6 +38,8 @@ website:
         menu:
           - text: "County: Dr. Visits"
             href: indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html
+          - text: "State: Dr. Visits vs Multiple References"
+            href: indicator_analysis/indicator_multi_comparison.html
           - text: "State: HHS vs Dr. Visits"
             href: indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html
           - text: "Diarrhea: Emergency Department Visits"

@@ -167,7 +167,7 @@ reference_palette <- function(refs) {
     setNames(rep(dis_pal_list, length.out = length(refs)), refs)
 }
 
-wrap_legend_label <- function(x) {
+clean_legend_label <- function(x) {
     stringr::str_squish(stringr::str_replace_all(x, "\n", " "))
 }
 
@@ -859,6 +859,7 @@ lag_summary <- cor_sweep_geo %>%
     )
 
 optimal_lag <- lag_summary %>%
+    filter(is.finite(mean_cor)) %>%
     group_by(reference_id, reference_name, reference_label) %>%
     slice_max(mean_cor, n = 1, with_ties = FALSE) %>%
     ungroup()
@@ -1068,7 +1069,7 @@ ggplot(trend_long, aes(x = time_value, y = median_norm, color = indicator_label)
     geom_line(linewidth = 0.85, alpha = 0.9) +
     scale_x_date(breaks = breaks_pretty(n = 7), labels = label_date_short()) +
     scale_y_continuous(breaks = breaks_pretty()) +
-    scale_color_manual(values = trend_cols, labels = wrap_legend_label) +
+    scale_color_manual(values = trend_cols, labels = clean_legend_label) +
     labs(
         title = "Median normalized trend across panels",
         x = "Date", y = "Median normalized value", color = "Indicator"
@@ -1189,7 +1190,7 @@ knitr::opts_current$set(fig.height = scaled_fig_height(length(coverage_refs), ba
 
 ggplot(coverage, aes(x = time_value, y = locations, color = availability)) +
     geom_step(direction = "mid", linewidth = 0.5) +
-    facet_wrap(~stringr::str_wrap(reference_name, width = 30), ncol = 1) +
+    facet_wrap(~stringr::str_wrap(reference_name, width = 30), ncol = 1, scales = "free_y") +
     scale_x_date(breaks = breaks_pretty(), labels = label_date_short()) +
     scale_y_continuous(labels = label_comma()) +
     scale_color_manual(values = c(Candidate = dis_pal_list[2], Reference = dis_pal_list[1], Both = dis_pal_list[4])) +
@@ -1367,7 +1368,7 @@ p_cv_pair <- ggplot(noise_stats_plot, aes(x = reference_cv, y = candidate_cv, co
     geom_point(alpha = 0.55, size = 1.7) +
     scale_x_continuous(labels = label_percent(), breaks = breaks_pretty()) +
     scale_y_continuous(labels = label_percent(), breaks = breaks_pretty()) +
-    scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
+    scale_color_manual(values = ref_cols, labels = clean_legend_label) +
     labs(
         title = "Paired CV comparison",
         x = "Reference CV", y = "Candidate CV", color = "Reference indicator"
@@ -1412,8 +1413,8 @@ ggplot(cor_by_time, aes(x = time_value, y = cor, color = reference_label)) +
     geom_smooth(aes(fill = reference_label), method = "loess", span = 0.2, se = FALSE, linewidth = 1.1) +
     scale_x_date(breaks = breaks_pretty(), labels = label_date_short()) +
     scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
-    scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
-    scale_fill_manual(values = ref_cols, labels = wrap_legend_label) +
+    scale_color_manual(values = ref_cols, labels = clean_legend_label) +
+    scale_fill_manual(values = ref_cols, labels = clean_legend_label) +
     labs(
         title = "Pairwise geographic rank correlation over time",
         x = "Date", y = "Spearman correlation across locations",
@@ -1587,8 +1588,8 @@ ggplot(lag_summary, aes(x = lag, y = median_cor, color = reference_label, fill =
         inherit.aes = FALSE,
         shape = 21, fill = "white", color = "black", size = 3, stroke = 0.8
     ) +
-    scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
-    scale_fill_manual(values = ref_cols, labels = wrap_legend_label) +
+    scale_color_manual(values = ref_cols, labels = clean_legend_label) +
+    scale_fill_manual(values = ref_cols, labels = clean_legend_label) +
     scale_x_continuous(breaks = breaks_pretty(n = 12)) +
     scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
     labs(
@@ -1659,7 +1660,7 @@ ggplot(cor_lagged_time_selected, aes(x = time_value, y = cor, color = reference_
     facet_wrap(~lag, ncol = 1) +
     scale_x_date(breaks = breaks_pretty(), labels = label_date_short()) +
     scale_y_continuous(limits = c(-1, 1), breaks = breaks_pretty()) +
-    scale_color_manual(values = ref_cols, labels = wrap_legend_label) +
+    scale_color_manual(values = ref_cols, labels = clean_legend_label) +
     labs(
         title = sprintf("Pairwise geographic correlation over time at selected %s", time_unit),
         x = "Date", y = "Spearman correlation across locations",
