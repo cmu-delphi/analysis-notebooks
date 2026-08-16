@@ -20,10 +20,27 @@ params:
   time_type:
   start_day:
   end_day:
+  # Extra key columns beyond geo_value/time_value (character vector), e.g. "age_group"
+  extra_keys: !expr "character(0)"
+  # First month of the epidemiological year used by the seasonality panels.
+  # 7 = July-June, the usual influenza convention.
+  season_start_month: 7
+  # Smooth the quantile trends with a moving average. Meant for raw data with a
+  # day-of-week effect; set to false for indicators already smoothed at source.
+  smooth_quantiles: true
+  # Show the cross-sectional geographic outlier table (2.2.1)
+  show_geo_outliers: true
+  # Show the versioning summary. Off also skips the version-history query, which
+  # is the slowest part of the report; use revision_analysis.qmd for the detail.
+  show_versioning: true
   # Maximum locations to show in plots/tables
   max_locations_plot: 60
   max_archive_locs: 60
   min_archive_days: 60  # Minimum days of version history to enable revision analysis
+  # A confidence band wider than (this multiplier x the value range) is dropped
+  # from the location dropdown plot (2.2.2) as a near-empty-denominator outlier.
+  # Raise it (e.g. Inf) to draw every reported band regardless of width.
+  ci_band_limit_mult: 1
 knitr:
   opts_chunk:
     comment: "#>"
@@ -55,9 +72,15 @@ if (!exists("params")) {
         time_type = NULL,
         end_day = format(Sys.Date()),
         start_day = format(Sys.Date() - 365 * 2),
+        extra_keys = character(0),
+        season_start_month = 7,
+        smooth_quantiles = TRUE,
+        show_geo_outliers = TRUE,
+        show_versioning = TRUE,
         max_locations_plot = 60,
         max_archive_locs = 60,
-        min_archive_days = 60
+        min_archive_days = 60,
+        ci_band_limit_mult = 1
     )
 }
 
@@ -87,30 +110,19 @@ params$geo_type <- flatten_param(params$geo_type)
 params$time_type <- flatten_param(params$time_type)
 params$input_csv <- flatten_param(params$input_csv)
 
-# Helper to resolve relative file paths across render working directories
-resolve_path <- function(path) {
-    if (is.null(path) || !nzchar(path)) return(path)
-    if (file.exists(path)) return(path)
-    cur_dir <- basename(getwd())
-    prefix <- paste0("^", cur_dir, "/")
-    if (grepl(prefix, path)) {
-        stripped_path <- sub(prefix, "", path)
-        if (file.exists(stripped_path)) {
-            return(stripped_path)
-        }
-    }
-    parent_path <- file.path("..", path)
-    if (file.exists(parent_path)) {
-        return(parent_path)
-    }
-    return(path)
-}
-params$input_csv <- resolve_path(params$input_csv)
-
+# The CSV path is relative to whichever directory quarto renders from, so try it
+# as given, with the current directory's name stripped, and one level up.
 if (!is.null(params$input_csv) && nzchar(params$input_csv)) {
-    if (!file.exists(params$input_csv)) {
+    candidates <- c(
+        params$input_csv,
+        sub(paste0("^", basename(getwd()), "/"), "", params$input_csv),
+        file.path("..", params$input_csv)
+    )
+    found <- candidates[file.exists(candidates)]
+    if (length(found) == 0) {
         stop(sprintf("Local CSV file not found at path: %s", params$input_csv))
     }
+    params$input_csv <- found[1]
 }
 
 # When using CSV route, source/indicator labels default to the CSV filename
@@ -166,6 +178,24 @@ signals_vec <- if (!is.null(params$signal) && length(params$signal) > 0 &&
     character(0)
 }
 multi_signal <- length(signals_vec) > 1
+
+# `signal` is just another key column. Where the epi_df/epi_archive are built
+# below, signal_format = "add_key" folds it into other_keys when the column is
+# present, and "as_is" leaves the frame alone when it isn't.
+
+# Used inline in the markdown so the prose is plural only when more than one
+# indicator was loaded.
+ind <- if (multi_signal) "indicators" else "indicator"
+ind_poss <- if (multi_signal) "indicators'" else "indicator's"
+sg_pl <- function(singular, plural) if (multi_signal) plural else singular
+
+# Data with no signal column carries one indicator, so its label is constant
+# and subsetting by indicator is a no-op. `has_signal` is set at load time; both
+# helpers resolve it when called.
+add_indicator <- function(df) {
+    mutate(df, indicator = if (has_signal) unname(signal_labels[signal]) else name_vec[1])
+}
+filter_signal <- function(df, sig) if (has_signal) filter(df, signal == sig) else df
 
 # Build signal labels (name falls back to signal if not provided)
 name_vec <- {
@@ -247,10 +277,7 @@ tibble::tribble(
         updater(name, setNames(list(dis_pal_list[1], alpha), c(aes, "alpha")))
     })
 
-# Helper: round any date to the immediately preceding Sunday (or same day if already Sunday)
-round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
-
-# Helper: build epirange with correct format for the indicator's time_type
+# An epirange in whatever format the indicator's time_type needs
 time_range <- function(start, end, time_type = params$time_type) {
     if (time_type == "week") {
         to_yw <- function(d) {
@@ -264,23 +291,30 @@ time_range <- function(start, end, time_type = params$time_type) {
     }
 }
 
-# Helper: map geo codes to readable names
+# Map geo codes to readable names, for display only: the codes stay in the data
+# because the API queries and the HHS crosswalk join on them. Unmapped codes and
+# unrecognized geo types are returned unchanged.
 geo_to_name <- function(geos, geo_type = params$geo_type) {
-    if (geo_type == "state") {
-        names <- covidcast::abbr_to_name(toupper(geos))
-    } else if (geo_type == "county") {
-        names <- covidcast::county_fips_to_name(as.character(geos))
-    } else if (geo_type == "msa") {
-        names <- covidcast::cbsa_to_name(as.character(geos))
-    } else {
+    names <- switch(geo_type,
+        state  = covidcast::abbr_to_name(toupper(geos)),
+        # County names alone repeat across states (e.g. many "Washington
+        # County"s), so tag each with its state abbreviation. ifelse (not
+        # paste0 directly) keeps unmapped codes NA, so the fallback below
+        # still catches them instead of yielding a literal "NA, NA".
+        county = {
+            cty_name <- covidcast::county_fips_to_name(as.character(geos))
+            st_abbr <- covidcast::fips_to_abbr(as.character(geos))
+            ifelse(is.na(cty_name) | is.na(st_abbr), NA_character_,
+                   paste0(cty_name, ", ", st_abbr))
+        },
+        msa    = covidcast::cbsa_to_name(as.character(geos)),
         return(geos)
-    }
-    # Fallback to original codes for any missing mappings
+    )
     names[is.na(names)] <- geos[is.na(names)]
-    return(names)
+    names
 }
 
-# Helper: consistent random sample from a vector
+# Reproducible sample of at most n elements
 random_sample <- function(vec, n = 15) {
     if (length(vec) <= n) {
         return(vec)
@@ -288,24 +322,213 @@ random_sample <- function(vec, n = 15) {
     withr::with_seed(42, sort(sample(vec, n)))
 }
 
-# Helper function to print list (up to 15 obs)
-format_excluded <- function(locs, names) {
+# Comma-separated list of locations, capped at 15
+format_excluded <- function(locs) {
     if (length(locs) == 0) {
         return(NULL)
     }
-    sampled_idx <- match(random_sample(locs), locs)
-    sampled_locs <- locs[sampled_idx]
-    sampled_names <- names[sampled_idx]
-    entries <- ifelse(
-        sampled_locs == sampled_names,
-        sampled_locs,
-        sprintf("%s (%s)", sampled_locs, sampled_names)
-    )
-    if (length(locs) > 15) {
-        paste0(paste(entries, collapse = ", "), ", etc.")
-    } else {
-        paste(entries, collapse = ", ")
+    entries <- geo_to_name(random_sample(locs))
+    paste0(paste(entries, collapse = ", "), if (length(locs) > 15) ", etc." else "")
+}
+
+# Order stratum levels as a reader expects rather than alphabetically: aggregate
+# levels first, then by leading number so "5-17" precedes "18-49", with
+# open-ended low bins like "<1" below their own number.
+agg_level_names <- c("all", "total", "overall", "all ages", "all_ages", "any")
+order_strata <- function(x) {
+    lv <- sort(unique(as.character(x[!is.na(x)])))
+    is_agg <- tolower(lv) %in% agg_level_names
+    rest <- lv[!is_agg]
+    num <- suppressWarnings(as.numeric(str_extract(rest, "[0-9]+\\.?[0-9]*")))
+    num <- num - 0.5 * str_detect(tolower(rest), "^\\s*(<|under|less|up to)")
+    factor(x, levels = c(lv[is_agg], rest[order(num, rest, na.last = TRUE)]))
+}
+
+# Order stratum columns and append each level's location count to its label,
+# since panels drawn from different location sets are not comparable. The count
+# is per indicator too: pooling would report the union on every panel.
+label_strata_coverage <- function(df, keys, src = df_candidate) {
+    src <- as_tibble(src) %>% filter(!is.na(value))
+    sig <- intersect(signal_key, names(df))
+    for (k in keys) {
+        f <- order_strata(df[[k]])
+        cnt <- src %>%
+            group_by(across(all_of(c(sig, k)))) %>%
+            summarize(n = n_distinct(geo_value), .groups = "drop")
+        # Match on the stratum level, and on the indicator too when there is one.
+        idx <- if (length(sig) == 0) {
+            match(as.character(f), as.character(cnt[[k]]))
+        } else {
+            match(
+                paste(df[[sig]], as.character(f)),
+                paste(cnt[[sig]], as.character(cnt[[k]]))
+            )
+        }
+        n <- cnt$n[idx]
+        lab <- if_else(is.na(n), as.character(f), sprintf("%s (%s locs)", as.character(f), n))
+        # Order by the underlying level, so appending the count does not resort
+        # the panels back into alphabetical order.
+        ord <- unique(lab[order(f, lab)])
+        df[[k]] <- factor(lab, levels = ord[!is.na(ord)])
     }
+    df
+}
+
+# Interactive time series: one dropdown entry per location, one trace per
+# stratum, gaps left unbridged, markers on reported periods. A confidence band
+# shares its stratum's legend entry, so hiding a stratum hides its band too.
+# Called once, but kept a function on purpose: it is meant to move to
+# epiprocess, which autoplot() cannot do because it draws no intervals.
+plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
+    groups <- as.character(sort(unique(df$geo_value)))
+    # An estimate on a near-empty denominator has an interval about as wide as
+    # the whole indicator; drawn, it is a full-height column that buries every
+    # other series. Skip those and report how many. The cut-off is the span of
+    # the values, so it scales with the indicator rather than being a constant.
+    band_limit <- if (!is.null(ci_cols)) {
+        diff(range(df$value, na.rm = TRUE)) * params$ci_band_limit_mult
+    } else NULL
+    n_band_wide <- 0L
+    n_band_obs <- 0L
+    strata <- if (is.null(trace_col)) NA_character_ else levels(order_strata(df[[trace_col]]))
+    # Interpolate rather than recycle: two strata sharing a colour is unreadable
+    # once bands are drawn as well.
+    pal <- setNames(
+        if (length(strata) <= length(dis_pal_list)) {
+            dis_pal_list[seq_along(strata)]
+        } else {
+            grDevices::colorRampPalette(dis_pal_list)(length(strata))
+        },
+        strata
+    )
+
+    specs <- list()
+    for (g in groups) {
+        for (s in strata) {
+            d <- df %>% filter(geo_value == g)
+            if (!is.na(s)) d <- d %>% filter(.data[[trace_col]] == s)
+            d <- d %>% arrange(time_value)
+            if (nrow(d) == 0 || all(is.na(d$value))) next
+            lab <- if (is.na(s)) "Value" else s
+            col <- unname(if (is.na(s)) dis_pal_list[1] else pal[[s]])
+            if (!is.null(ci_cols)) {
+                # One band per contiguous run of reported bounds. A band is a
+                # c(x, rev(x)) polygon, so an NA inside it shifts the return leg
+                # and detaches the band from its line. Splitting on gaps also
+                # keeps a band from spanning a period with no data.
+                ok <- !is.na(d[[ci_cols[1]]]) & !is.na(d[[ci_cols[2]]])
+                too_wide <- ok & (d[[ci_cols[2]]] - d[[ci_cols[1]]]) > band_limit
+                n_band_obs <- n_band_obs + sum(ok)
+                n_band_wide <- n_band_wide + sum(too_wide)
+                ok <- ok & !too_wide
+                for (seg in split(d[ok, , drop = FALSE], cumsum(!ok)[ok])) {
+                    specs <- append(specs, list(list(
+                        d = seg, col = col, lab = lab, grp = g,
+                        kind = "ci", legend_ok = FALSE
+                    )))
+                }
+            }
+            specs <- append(specs, list(list(
+                d = d, col = col, lab = lab, grp = g,
+                kind = "line", legend_ok = !is.na(s)
+            )))
+        }
+    }
+    if (length(specs) == 0) return(NULL)
+
+    trace_grp <- map_chr(specs, "grp")
+    legend_ok <- map_lgl(specs, "legend_ok")
+    active <- trace_grp == groups[1]
+
+    p <- reduce(seq_along(specs), function(p, i) {
+        sp <- specs[[i]]
+        if (sp$kind == "ci") {
+            plotly::add_ribbons(p,
+                x = sp$d$time_value,
+                ymin = sp$d[[ci_cols[1]]], ymax = sp$d[[ci_cols[2]]],
+                line = list(width = 0), fillcolor = plotly::toRGB(sp$col, 0.2),
+                name = sp$lab, legendgroup = sp$lab,
+                showlegend = FALSE, visible = active[i],
+                hoverinfo = "skip"
+            )
+        } else {
+            plotly::add_trace(p,
+                x = sp$d$time_value, y = sp$d$value,
+                type = "scatter", mode = "lines+markers", connectgaps = FALSE,
+                line = list(color = sp$col, width = 1.5),
+                marker = list(color = sp$col, size = 3),
+                name = sp$lab, legendgroup = sp$lab,
+                showlegend = active[i] && legend_ok[i], visible = active[i],
+                hovertemplate = paste0(
+                    "%{x|%Y-%m-%d}<br>Value: %{y:.3f}",
+                    "<extra>", sp$lab, "</extra>"
+                )
+            )
+        }
+    }, .init = plotly::plot_ly())
+
+    # Scale the y axis to the values, not the bands: letting a near-empty
+    # denominator's interval set the axis compresses every series into a sliver
+    # along the bottom. Overshooting bands are clipped but stay zoomable.
+    yrange <- NULL
+    if (!is.null(ci_cols)) {
+        vals <- df$value[is.finite(df$value)]
+        if (length(vals) > 0 && diff(range(vals)) > 0) {
+            yrange <- c(min(0, min(vals)), max(vals) + 0.15 * diff(range(vals)))
+        }
+    }
+
+    buttons <- map(groups, function(g) {
+        on <- trace_grp == g
+        list(
+            method = "update",
+            args = list(
+                list(visible = as.list(on), showlegend = as.list(on & legend_ok)),
+                list(title = list(text = paste0("Location: ", g)))
+            ),
+            label = g
+        )
+    })
+
+    p <- p %>%
+        plotly::layout(
+            title = list(text = paste0("Location: ", groups[1])),
+            xaxis = list(title = "Date"),
+            yaxis = list(title = "Value", range = yrange),
+            legend = list(title = list(text = trace_col %||% "")),
+            updatemenus = list(list(
+                type = "dropdown", active = 0, buttons = buttons, x = 0.05, y = 1.15
+            ))
+        ) %>%
+        plotly::config(modeBarButtonsToRemove = c("zoomIn2d", "zoomOut2d"))
+
+    # Counts ride along on the plot so the chunk can report them.
+    attr(p, "bands_wide") <- n_band_wide
+    attr(p, "bands_total") <- n_band_obs
+    p
+}
+
+# Optional sections, all on when the param is absent.
+smooth_quantiles <- !isFALSE(params$smooth_quantiles)
+show_geo_outliers <- !isFALSE(params$show_geo_outliers)
+show_versioning <- !isFALSE(params$show_versioning)
+
+# Assign each observation to an epidemiological year starting in
+# `season_start_month` (7 = July-June, the usual influenza convention).
+season_start_month <- as.integer(params$season_start_month %||% 7L)
+season_label <- sprintf(
+    "%s-%s", month.name[season_start_month],
+    month.name[((season_start_month + 10L) %% 12L) + 1L]
+)
+add_season <- function(df) {
+    df %>%
+        mutate(
+            yr = as.integer(format(time_value, "%Y")),
+            month = as.integer(format(time_value, "%m")),
+            season_start = if_else(month >= season_start_month, yr, yr - 1L),
+            season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
+            season_month = ((month - season_start_month) %% 12L) + 1L
+        )
 }
 
 # Set cache
@@ -315,30 +538,7 @@ if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
 set_cache(cache_dir = cache_path)
 ```
 
-This notebook evaluates a **candidate indicator** to understand its characteristics, coverage, missingness, and versioning/revision behavior.
-
-```{r}
-#| label: print-config
-#| echo: false
-config_tbl <- tibble(
-    Field = c("Source", "Signal(s)", "Label(s)", "Geography", "Period"),
-    Value = c(
-        params$source,
-        paste(signals_vec, collapse = ", "),
-        paste(str_remove(name_vec, "\\n"), collapse = ", "),
-        if (is.null(params$geo_type) || !nzchar(params$geo_type)) NA_character_ else params$geo_type,
-        paste(params$start_day, "to", params$end_day)
-    )
-) %>%
-    filter(!is.na(Value))
-
-DT::datatable(
-    config_tbl,
-    caption = "Analysis configuration",
-    rownames = FALSE,
-    options = list(scrollX = TRUE, dom = "t", paging = FALSE)
-)
-```
+This notebook evaluates `r sg_pl("a **candidate indicator**", "the **candidate indicators**")` to understand `r sg_pl("its", "their")` characteristics, coverage, missingness, and versioning/revision behavior.
 
 ---
 
@@ -347,16 +547,22 @@ DT::datatable(
 ```{r}
 #| label: load-candidate
 #| results: asis
-# Load candidate indicator
+# Load candidate indicator. `load_note` records where the data came from and
+# `n_dropped` how many rows were discarded, both reported in the prose below.
 candidate_archive <- NULL
+load_note <- "the source"
+n_dropped <- 0L
 if (!is.null(params$input_csv)) {
-    df_candidate_raw <- read.csv(params$input_csv) %>%
+    # geo_value stays character: a numeric guess would strip the leading zero
+    # from county FIPS codes in states 01-09 (AL, AK, AZ, AR, CA, CO, CT).
+    df_candidate_raw <- read.csv(params$input_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
         filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day))
 
-    # Add signal column if missing (required for long signal format)
-    if (!("signal" %in% colnames(df_candidate_raw))) {
-        df_candidate_raw$signal <- if (length(signals_vec) > 0) signals_vec[1] else "value"
+    # A file may hold more indicators than were asked for. Keep only the
+    # requested ones, or every one of them would be analysed and labelled NA.
+    if ("signal" %in% colnames(df_candidate_raw) && length(signals_vec) > 0) {
+        df_candidate_raw <- df_candidate_raw %>% filter(signal %in% signals_vec)
     }
 
     # CSV may include version/issue columns for revision analysis
@@ -367,22 +573,32 @@ if (!is.null(params$input_csv)) {
                 if ("issue" %in% names(.)) rename(., version = issue) else .
             } %>%
             mutate(version = as.Date(version))
+
+        # A row with no version has no place on a version timeline. A file
+        # holding both versioned and unversioned copies of the same observations
+        # is usually a build accident, and keeping both doubles every series.
+        n_dropped <- sum(is.na(df_candidate_raw$version))
+        if (n_dropped > 0) df_candidate_raw <- df_candidate_raw %>% filter(!is.na(version))
+
+        # Confidence bounds ride along as extra value columns, so the overview
+        # plot can draw bands for versioned CSVs too.
         csv_archive_df  <- df_candidate_raw %>%
-            select(geo_value, time_value, version, any_of("signal"), value) %>%
-            group_by(geo_value, time_value, version, pick(any_of("signal"))) %>%
+            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys),
+                   value, any_of(c("ci_lower", "ci_upper"))) %>%
+            group_by(geo_value, time_value, version, pick(any_of(c("signal", params$extra_keys)))) %>%
             slice_max(value, n = 1, with_ties = FALSE) %>%
             ungroup()
 
-        candidate_archive <- csv_archive_df %>%
-            as_epi_archive(signal_format = "long")
+        candidate_archive <- as_epi_archive(csv_archive_df, other_keys = params$extra_keys,
+            signal_format = if ("signal" %in% names(csv_archive_df)) "add_key" else "as_is")
         df_candidate <- epix_as_of(candidate_archive, candidate_archive$versions_end)
-        cat(sprintf(
-            "- CSV contains version history: %s versions\n",
-            label_comma()(n_distinct(df_candidate_raw$version))
-        ))
+        n_versions <- n_distinct(df_candidate_raw$version)
+        load_note <- sprintf("a local CSV with %s version%s of history",
+                             label_comma()(n_versions), if (n_versions == 1) "" else "s")
     } else {
-        df_candidate <- df_candidate_raw %>%
-            as_epi_df(signal_format = "long")
+        df_candidate <- as_epi_df(df_candidate_raw, other_keys = params$extra_keys,
+            signal_format = if ("signal" %in% names(df_candidate_raw)) "add_key" else "as_is")
+        load_note <- "a local CSV"
     }
 } else {
     # Determine if new API can be used for candidate source
@@ -412,45 +628,119 @@ if (!is.null(params$input_csv)) {
                         filter(., fill_method == "source" | !any(fill_method == "source"))
                     } else .
                 } %>%
-                # {
-                #     if ("version" %in% colnames(.)) {
-                #         group_by(., geo_value, time_value) %>%
-                #             slice_max(version, n = 1, with_ties = FALSE) %>%
-                #             ungroup()
-                #     } else .
-                # } %>%
                 filter(
                     time_value >= as.Date(params$start_day),
                     time_value <= as.Date(params$end_day)
                 ) %>%
-                select(geo_value, any_of("signal"), time_value, value)
+                select(geo_value, any_of("signal"), time_value, any_of(params$extra_keys),
+                       value, any_of(c("ci_lower", "ci_upper")))
         }) %>%
             bind_rows() %>%
-            as_epi_df(signal_format = "long")
+            as_epi_df(other_keys = params$extra_keys,
+                      signal_format = if ("signal" %in% names(.)) "add_key" else "as_is")
     } else {
-        # pub_covidcast accepts a signal vector and returns a signal column
+        # pub_covidcast accepts a signal vector and always returns a signal column
         df_candidate <- pub_covidcast(
             params$source, signals_vec,
             params$geo_type, params$time_type,
             time_values = time_range(params$start_day, params$end_day),
             as_of = Sys.Date()
-        ) %>% as_epi_df(signal_format = "long")
+        ) %>% as_epi_df(other_keys = params$extra_keys, signal_format = "add_key")
     }
+    load_note <- sprintf("the %s API", params$source)
 }
 
-cat(sprintf(
-    "- **Summary**: %s rows across %s locations and %d signal(s)\n",
-    label_comma()(nrow(df_candidate)),
-    label_comma()(n_distinct(df_candidate$geo_value)),
-    length(signals_vec)
+# Resolved before the archive fetch so the table below can report periods
+# and strata.
+env_time_type <- attributes(df_candidate)$metadata$time_type
+if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
+    env_time_type <- params$time_type
+}
+if (is.null(env_time_type) || !nzchar(env_time_type)) {
+    env_time_type <- "day"
+}
+params$time_type <- env_time_type
+
+env_geo_type <- attributes(df_candidate)$metadata$geo_type
+if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
+    params$geo_type <- env_geo_type
+}
+
+# The keys beyond geo_value/time_value, `signal` among them whenever the column
+# exists. Every grouping, join and denominator below uses this vector, so both
+# kinds of key are handled the same way.
+has_signal <- "signal" %in% colnames(df_candidate)
+signal_key <- if (has_signal) "signal" else character(0)
+# Signal first, so tables that show it lead with the Indicator column.
+strat_keys <- c(signal_key, params$extra_keys)
+
+n_locations <- n_distinct(df_candidate$geo_value)
+n_periods <- n_distinct(df_candidate$time_value)
+
+# Stratum levels per extra key, and the (period x stratum) cells a location
+# could fill. Used by the table below and by the missingness section.
+strata_levels <- map(set_names(params$extra_keys), ~ sort(unique(as.character(df_candidate[[.x]]))))
+n_key_combos <- if (length(params$extra_keys) > 0) {
+    df_candidate %>% as_tibble() %>% distinct(across(all_of(params$extra_keys))) %>% nrow()
+} else {
+    1L
+}
+n_strata_cells <- max(1L, prod(lengths(strata_levels)))
+
+# Length of the requested window, in the indicator's own periods
+req_days <- as.integer(as.Date(params$end_day) - as.Date(params$start_day)) + 1L
+req_periods <- round(req_days / switch(env_time_type,
+    day = 1, week = 7, month = 30.44, year = 365.25, 1
 ))
+```
+
+Loaded `r label_comma()(nrow(df_candidate))` rows via `r load_note`.`r if (n_dropped > 0) sprintf(" %s row(s) carried no version and were dropped.", label_comma()(n_dropped))` The table below describes the data as loaded.
+
+```{r}
+#| label: print-config
+#| echo: false
+config_tbl <- tibble(
+    Field = c(
+        "Source", "Indicator(s)", "Label(s)", "Geography", "Locations",
+        "Extra key(s)", "Requested period", "Observed period"
+    ),
+    Value = c(
+        params$source,
+        if (has_signal) paste(sort(unique(df_candidate$signal)), collapse = ", ") else paste(signals_vec, collapse = ", "),
+        paste(str_remove(name_vec, "\\n"), collapse = ", "),
+        if (is.null(params$geo_type) || !nzchar(params$geo_type)) NA_character_ else params$geo_type,
+        label_comma()(n_locations),
+        if (length(params$extra_keys) == 0) {
+            NA_character_
+        } else {
+            paste(sprintf(
+                "%s (%d level(s): %s)", names(strata_levels), lengths(strata_levels),
+                map_chr(strata_levels, ~ paste(levels(order_strata(.x)), collapse = ", "))
+            ), collapse = "; ")
+        },
+        sprintf("%s to %s (about %s %s(s))", params$start_day, params$end_day,
+                label_comma()(req_periods), env_time_type),
+        sprintf("%s to %s (%s %s(s) observed)",
+                format(min(df_candidate$time_value)), format(max(df_candidate$time_value)),
+                label_comma()(n_periods), env_time_type)
+    )
+) %>%
+    filter(!is.na(Value))
+
+DT::datatable(
+    config_tbl,
+    caption = "Analysis configuration and loaded dataset",
+    rownames = FALSE,
+    options = list(scrollX = TRUE, dom = "t", paging = FALSE)
+)
 ```
 
 ```{r}
 #| label: load-candidate-archive
 #| results: asis
-# Fetch revision history from API if not already built from CSV
-if (is.null(candidate_archive) && is.null(params$input_csv)) {
+# Revision history from the API, unless the CSV already supplied it. Skipped
+# when the versioning section is off: issues = "*" is the slowest query here.
+if (show_versioning && is.null(candidate_archive) && is.null(params$input_csv)) {
     # Only fetch version history if the source supports revisions
     new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
     use_new_api <- FALSE
@@ -472,7 +762,7 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
         archive_geos <- random_sample(archive_geos, params$max_locations_plot)
     }
 
-    # Determine window of issues available
+    # Reach back before the analysis window to catch earlier issues
     archive_start <- as.Date(params$start_day) - 60
 
     archive_info <- list(
@@ -511,273 +801,146 @@ if (is.null(candidate_archive) && is.null(params$input_csv)) {
     }
 
     if (nrow(df_archive_raw) > 0) {
+        # ponytail: no dedup here. Sources like NWSS can return several rows per
+        # (geo, period, version) from different measurement sources, which
+        # as_epi_archive() rejects; add a slice_max if one turns up.
         df_archive_raw <- df_archive_raw %>%
             rename(any_of(c(time_value = "reference_time", version = "issue"))) %>%
             rename(any_of(c(version = "report_time"))) %>%
-            select(geo_value, time_value, version, any_of("signal"), value) #%>%
-            # Deduplicate: sources like NWSS can have multiple rows per
-            # (geo, time, version) from different measurement sources.
-            # group_by(geo_value, time_value, version, across(any_of("signal"))) %>%
-            # slice_max(value, n = 1, with_ties = FALSE) %>%
-            # ungroup()
+            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys), value)
 
         if ("version" %in% colnames(df_archive_raw)) {
             archive_info$version_start <- min(df_archive_raw$version)
             archive_info$version_end <- max(df_archive_raw$version)
-            candidate_archive <- df_archive_raw %>%
-                as_epi_archive(signal_format = "long")
+            candidate_archive <- as_epi_archive(df_archive_raw, other_keys = params$extra_keys,
+                signal_format = if ("signal" %in% names(df_archive_raw)) "add_key" else "as_is")
         }
     }
 }
-
-# Determine time type and number of locations
-env_time_type <- attributes(df_candidate)$metadata$time_type
-if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
-    env_time_type <- params$time_type
-}
-if (is.null(env_time_type) || !nzchar(env_time_type)) {
-    env_time_type <- "day"
-}
-params$time_type <- env_time_type
-
-env_geo_type <- attributes(df_candidate)$metadata$geo_type
-if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
-    params$geo_type <- env_geo_type
-}
-
-n_locations <- n_distinct(df_candidate$geo_value)
 ```
 
 ```{r}
 #| label: quarto-metadata
 #| results: asis
 #| echo: false
-# Dynamically set Quarto metadata so we can use it in ::: {.content-visible}
-# blocks later.
+# Quarto metadata for the ::: {.content-visible} blocks below.
 cat(sprintf(
-    "\n---\nmulti_location: %s\n---\n",
-    tolower(n_locations > 1)
+    "\n---\nmulti_location: %s\nhas_strata: %s\ngeo_outliers: %s\nversioning: %s\n---\n",
+    tolower(n_locations > 1),
+    tolower(length(params$extra_keys) > 0),
+    tolower(show_geo_outliers && n_locations > 1),
+    tolower(show_versioning)
 ))
 ```
 
 ## Exploratory Data Analysis {#eda}
 
-The data is aggregated at the `r params$geo_type` level. The dataset contains `r n_locations` valid locations measured at a `r env_time_type`-level frequency.
+The data covers `r n_locations` `r params$geo_type`s at `r env_time_type` frequency.
 
-### Time Series Overview
-
-This section provides a visual overview of the candidate indicator over time for a subset of observation locations. We look at the raw values for the indicator across a sample of locations.
-
-```{r}
-#| label: eda-overview
-#| fig-height: 4
-# Pick a diverse sample of locations for visualization
-all_geos <- sort(unique(df_candidate$geo_value))
-n_plot <- min(length(all_geos), params$max_locations_plot)
-sample_geos <- random_sample(all_geos, n_plot)
-
-df_sample <- df_candidate %>%
-    filter(geo_value %in% sample_geos)
-
-autoplot(df_sample, value,
-        .interactive = TRUE, .facet_by = "geo_value", .facet_to_dropdown = TRUE) %>%
-        plotly::toWebGL() %>%
-        plotly::partial_bundle()
-```
-
-::: {.content-visible when-meta="multi_location"}
-
-### Quantile Trends
-
-This plot displays the distribution of both indicators over time across all included locations. The solid line represents the median, the inner ribbon shows the 25th to 75th percentile range, and the outer ribbon covers the 5th to 95th percentile range. We smooth the data with a moving average to handle day-of-week effects, and we use different scales for the top and bottom panels so each indicator's distribution is clearly visible.
-
-By observing the width of these ribbons, you can get a sense of geographic variability. Narrow ribbons mean the values are tightly clustered across locations, while wide ribbons show more spread. This helps us assess the overall stability and systemic trends of the indicators.
-
-```{r}
-#| label: eda-quantiles
-#| fig-height: !expr min(max(5, length(signals_vec)*1.5), 15)
-#| eval: !expr n_locations > 1
-cat("\n")
-
-# Aggregate location values per (signal, time_value); use signal name as geo_value
-# so epi_slide partitions by signal automatically.
-df_quantiles_wide <- df_candidate %>%
-    group_by(signal, time_value) %>%
-    summarize(
-        vals = list(value), 
-        geo_value = "all",
-        .groups = "drop"
-    ) %>%
-    as_epi_df(signal_format = "long")
-
-# Handle time frequency differences for .window_size.
-window_size <- switch(env_time_type %||% "unknown",
-    day   = 7L, # 7-day smoothing
-    week  = as.difftime(3, units = "weeks"), # 3-week smoothing
-    month = as.difftime(3, units = "months"), # 3-month smoothing
-    year  = as.difftime(3, units = "years"), # 3-year smoothing
-    Inf # Default to cumulative for unknown types
-    # (too sparse for sliding averages)
-)
-
-df_quantiles_wide <- df_quantiles_wide %>%
-    group_by(geo_value, signal) %>%
-    epi_slide(
-        ~ tibble(
-            `0.05` = quantile(unlist(.x$vals), 0.05, na.rm = TRUE),
-            `0.25` = quantile(unlist(.x$vals), 0.25, na.rm = TRUE),
-            `0.5`  = quantile(unlist(.x$vals), 0.5, na.rm = TRUE),
-            `0.75` = quantile(unlist(.x$vals), 0.75, na.rm = TRUE),
-            `0.95` = quantile(unlist(.x$vals), 0.95, na.rm = TRUE)
-        ),
-        .window_size = window_size
-    ) %>%
-    ungroup() %>%
-    mutate(indicator = signal_labels[signal])
-
-ggplot(df_quantiles_wide, aes(x = time_value)) +
-    geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
-    geom_ribbon(aes(ymin = `0.25`, ymax = `0.75`, fill = "25%-75%"), alpha = 0.4) +
-    geom_line(aes(y = `0.5`, color = "Median"), linewidth = 1) +
-    facet_wrap(~indicator, ncol = 1, scales = "free_y") +
-    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
-    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_si(""))) +
-    scale_fill_manual(values = c("5%-95%" = dis_pal_list[2], "25%-75%" = dis_pal_list[2])) +
-    scale_color_manual(values = c("Median" = dis_pal_list[2])) +
-    labs(
-        title = "Smoothed Quantile Trends",
-        subtitle = sprintf("Across all %d locations, smoothed window: %s", n_locations, format(window_size)),
-        x = "Date", y = "Value (smoothed)",
-        fill = "Range", color = "Trend"
-    ) +
-    theme(legend.position = "bottom")
-```
-
-#### Cross-Sectional Geographic Outliers
-
-While the quantile plots summarize the main body of the distribution, they may hide the behavior of individual highly erratic locations. Here, we track how often individual locations jump into the extreme upper tail (above the cross-sectional 95th percentile recorded on that specific date).
-
-::: {.callout-note}
-This approach compares locations against one another on each date. If the indicator relies on raw counts rather than population-standardized rates or percentages, this table will frequently just identify locations with the largest populations. In those cases, this metric reflects size rather than outliers.
-:::
-
-```{r}
-#| label: eda-aberrant-locations
-#| echo: false
-#| results: asis
-#| eval: !expr n_locations > 1
-# Calculate daily 95th percentiles per signal
-daily_p95 <- df_candidate %>%
-    group_by(signal, time_value) %>%
-    summarize(
-        cand_p95 = quantile(value, 0.95, na.rm = TRUE),
-        .groups = "drop"
-    )
-
-# Find how often each location exceeds the 95th percentile, per signal
-aberrant_locs <- df_candidate %>%
-    left_join(daily_p95, by = c("signal", "time_value")) %>%
-    group_by(signal, geo_value) %>%
-    summarize(
-        n_days = n(),
-        cand_aberrant_days = sum(value > cand_p95, na.rm = TRUE),
-        cand_aberrant_pct = (cand_aberrant_days / n_days) * 100,
-        .groups = "drop"
-    ) %>%
-    mutate(
-        geo_name     = geo_to_name(geo_value),
-        signal_label = signal_labels[signal]
-    ) %>%
-    arrange(desc(cand_aberrant_pct))
-
-if (nrow(aberrant_locs) > 0) {
-    aberrant_display <- if (multi_signal) {
-        aberrant_locs %>% select(signal_label, geo_value, geo_name, cand_aberrant_pct)
-    } else {
-        aberrant_locs %>% select(geo_value, geo_name, cand_aberrant_pct)
-    }
-    DT::datatable(
-        aberrant_display,
-        colnames = c(
-            if (multi_signal) "Signal" else NULL,
-            "Geo-level",
-            "Name",
-            "% Time Above 95th (candidate)"
-        ),
-        caption = "Summary of aberrant locations (time spent in the upper tail).",
-        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-    ) %>% DT::formatRound(columns = if (multi_signal) 4 else 3, digits = 1)
-} else {
-    cat("Insufficient data to calculate aberrant time for these locations.\n\n")
-}
-```
-
-
-
-
-
-:::
+Two words are used throughout. An **observation** is one row: a single value for one location, one `r env_time_type``r if (length(params$extra_keys) > 0) sprintf(" and one level of %s", paste(params$extra_keys, collapse = "/")) else ""`. A **location** is one `r params$geo_type`, so location counts are never observation counts.
 
 ::: {.content-visible when-meta="multi_location"}
 ### Coverage and Missingness
 
-This section explores the availability of data across time and space. The area chart below tracks the number of geographic locations with valid data on any given date for the candidate indicator.
+Coverage comes first because everything after it describes only the values that exist.
+
+A value is **missing** when no row exists for a (location, period`r if (length(params$extra_keys) > 0) ", stratum" else ""`) cell. Each location could fill `r label_comma()(n_periods)` `r env_time_type` period(s)`r if (n_strata_cells > 1) sprintf(" x %s stratum cell(s)", label_comma()(n_strata_cells)) else ""` = `r label_comma()(n_periods * n_strata_cells)` **possible periods with values**. Periods before any location's first reported period fall outside that grid, which is why the observed and requested windows differ in the table above.
+
+The chart below tracks how many locations report in each period, against the `r n_locations` in the dataset (dotted line).
 
 ```{r}
 #| label: eda-coverage
 #| echo: false
 #| results: asis
 coverage <- df_candidate %>%
-    group_by(signal, time_value) %>%
+    group_by(across(all_of(c(strat_keys, "time_value")))) %>%
     summarize(n_available = sum(!is.na(value)), .groups = "drop") %>%
     mutate(geo_value = "all") %>%
-    as_epi_df(signal_format = "long")
+    as_epi_df(signal_format = "as_is", other_keys = strat_keys) %>%
+    as_tibble() %>%
+    add_indicator() %>%
+    label_strata_coverage(params$extra_keys)
 
-# Determine smoothing window based on time type
-slide_window <- switch(env_time_type %||% "unknown",
-    day = 7L,
-    week = 4L,
-    month = 3L,
-    1L
-)
-
-if (env_time_type != params$time_type &&slide_window > 1) {
-    coverage <- coverage %>%
-        group_by(geo_value, signal) %>%
-        epi_slide(
-            n_available_smooth = mean(n_available, na.rm = TRUE),
-            .window_size = slide_window
-        ) %>%
-        ungroup() %>%
-        mutate(n_available = n_available_smooth)
-}
-
-coverage <- coverage %>%
-    mutate(indicator = signal_labels[signal])
+# The full (period x stratum) x location grid, NA wherever a location has no
+# row. Every missingness figure derives from it, so the per-location and
+# per-stratum views share one denominator.
+summary_base <- df_candidate %>%
+    as_tibble() %>%
+    select(all_of(c(strat_keys, "geo_value", "time_value")), value) %>%
+    complete(nesting(!!!rlang::syms(c(signal_key, "time_value"))),
+             !!!rlang::syms(params$extra_keys), geo_value)
 ```
 
 ```{r}
 #| label: eda-coverage-plot
-#| fig-height: !expr min(max(5, length(signals_vec)*2), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2), 12)
 #| echo: true
 ggplot(coverage, aes(x = time_value, y = n_available,
                      color = indicator, linetype = indicator)) +
+    geom_hline(yintercept = n_locations, linetype = 3, linewidth = 0.4, color = "gray50") +
     geom_line(linewidth = 0.8) +
     scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
     scale_y_continuous(labels = label_comma(), limits = c(0, NA)) +
     labs(
         title = "Data coverage over time",
-        subtitle = sprintf("Number of locations with non-missing values per %s%s", env_time_type,
-                           if (env_time_type != params$time_type && slide_window > 1) sprintf(" (%d-%s rolling average)", slide_window, env_time_type) else ""),
+        subtitle = sprintf("Number of locations with non-missing values per %s (dotted line: %d locations in the dataset)",
+                           env_time_type, n_locations),
         x = "Date", y = "Number of locations",
         color = "Indicator", linetype = "Indicator"
     ) +
-    {if (length(signals_vec) > 6) facet_wrap(~indicator, ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
+    {if (length(signals_vec) > 6 || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (length(signals_vec) > 6) "indicator", params$extra_keys)), ncol = 2, labeller = label_wrap_html(width = 25)) else NULL}
 ```
 
+::: {.content-visible when-meta="has_strata"}
+
+#### Missingness by Stratifier
+
+```{r}
+#| label: eda-missingness-by-stratum
+#| echo: false
+#| eval: !expr length(params$extra_keys) > 0
+show_ind_col <- has_signal && multi_signal
+
+strat_miss <- summary_base %>%
+    group_by(across(all_of(strat_keys))) %>%
+    summarize(
+        n_possible = n(),
+        n_obs = sum(!is.na(value)),
+        n_locs = n_distinct(geo_value[!is.na(value)]),
+        n_periods_obs = n_distinct(time_value[!is.na(value)]),
+        mean_val = mean(value, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        pct_missing = 100 * (1 - n_obs / n_possible),
+        across(all_of(params$extra_keys), order_strata)
+    ) %>%
+    add_indicator() %>%
+    arrange(across(all_of(params$extra_keys)), across(all_of(signal_key))) %>%
+    select(
+        any_of(if (show_ind_col) "indicator" else character(0)),
+        all_of(params$extra_keys), n_locs, n_periods_obs, n_obs, n_possible,
+        pct_missing, mean_val
+    )
+
+DT::datatable(
+    strat_miss,
+    colnames = c(
+        if (show_ind_col) "Indicator" else NULL,
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+        "Locations Reporting",
+        sprintf("%ss Reporting", str_to_title(env_time_type)),
+        "Periods with Values Reported", "Possible Periods with Values", "% Missing", "Avg. Value"
+    ),
+    caption = sprintf(
+        "Missingness by stratifier. Possible periods with values = %s %s period(s) x %s location(s) for each stratum.",
+        label_comma()(n_periods), env_time_type, label_comma()(n_locations)
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+) %>% DT::formatRound(columns = which(names(strat_miss) %in% c("pct_missing", "mean_val")), digits = 2)
+```
 
 :::
-
 
 #### Summary Statistics by Location
 
@@ -787,33 +950,31 @@ This table summarizes the available data across all included locations. Location
 #| label: eda-summary
 #| results: asis
 #| echo: false
-# Compute base stats per (signal, geo_value)
-summary_tbl_all <- df_candidate %>%
-    complete(signal, geo_value, time_value) %>%
-    group_by(signal, geo_value) %>%
+# Per (indicator, location) against the full grid, so a location missing an
+# entire stratum counts as missing rather than being ignored.
+summary_tbl_all <- summary_base %>%
+    group_by(across(all_of(c(signal_key, "geo_value")))) %>%
     summarize(
-        n_days = n(),
+        n_possible = n(),
+        n_obs = sum(!is.na(value)),
         cand_mean = mean(value, na.rm = TRUE),
         cand_var = var(value, na.rm = TRUE),
-        cand_miss_frac = mean(is.na(value)),
-        cand_miss = sprintf("%.1f%%", 100 * cand_miss_frac),
+        cand_miss_frac = 1 - n_obs / n_possible,
+        cand_miss = sprintf("%.1f%%", 100 * (1 - n_obs / n_possible)),
         .groups = "drop"
     ) %>%
-    mutate(
-        geo_name     = geo_to_name(geo_value),
-        signal_label = signal_labels[signal]
-    )
+    add_indicator()
 
 excluded_locs_df <- summary_tbl_all %>%
     filter(is.na(cand_mean) | cand_miss_frac == 1)
 if (nrow(excluded_locs_df) > 0) {
     for (sig in signals_vec) {
-        ex_sig <- excluded_locs_df %>% filter(signal == sig)
+        ex_sig <- excluded_locs_df %>% filter_signal(sig)
         if (nrow(ex_sig) > 0) {
             cat(sprintf(
                 "**Excluded locations (no data) — %s**: %s\n\n",
                 signal_labels[sig],
-                format_excluded(ex_sig$geo_value, ex_sig$geo_name)
+                format_excluded(ex_sig$geo_value)
             ))
         }
     }
@@ -823,18 +984,18 @@ zero_var_cand_locs_df <- summary_tbl_all %>%
     filter(!is.na(cand_var) & cand_var == 0 & cand_miss_frac < 1)
 if (nrow(zero_var_cand_locs_df) > 0) {
     for (sig in signals_vec) {
-        zv_sig <- zero_var_cand_locs_df %>% filter(signal == sig)
+        zv_sig <- zero_var_cand_locs_df %>% filter_signal(sig)
         if (nrow(zv_sig) > 0) {
             cat(sprintf(
                 "**Zero variance locations (flatlined) — %s**: %s\n\n",
                 signal_labels[sig],
-                format_excluded(zv_sig$geo_value, zv_sig$geo_name)
+                format_excluded(zv_sig$geo_value)
             ))
         }
     }
 }
 
-# Summary of missingness levels per signal
+# Summary of missingness levels per indicator
 miss_levels <- summary_tbl_all %>%
     mutate(
         cand_miss_group = case_when(
@@ -851,7 +1012,7 @@ for (sig in signals_vec) {
     cat(sprintf("**Missingness Overview%s:**\n\n",
                 if (multi_signal) sprintf(" — %s", signal_labels[sig]) else " (All Locations)"))
     cand_counts <- miss_levels %>%
-        filter(signal == sig) %>%
+        filter_signal(sig) %>%
         count(cand_miss_group) %>%
         complete(cand_miss_group, fill = list(n = 0))
     for (i in seq_len(nrow(cand_counts))) {
@@ -864,86 +1025,339 @@ for (sig in signals_vec) {
 summary_tbl <- summary_tbl_all %>%
     filter(!is.na(cand_mean) & cand_miss_frac < 1) %>%
     arrange(desc(cand_miss_frac)) %>%
-    {
-        if (multi_signal) select(., signal_label, geo_value, geo_name, n_days, cand_mean, cand_miss)
-        else select(., geo_value, geo_name, n_days, cand_mean, cand_miss)
-    }
+    mutate(geo_value = geo_to_name(geo_value)) %>%
+    select(
+        any_of(if (has_signal && multi_signal) "indicator" else character(0)),
+        geo_value, n_obs, n_possible, cand_mean, cand_miss
+    )
 
 DT::datatable(
     summary_tbl,
     colnames = c(
-        if (multi_signal) "Signal" else NULL,
-        sprintf("Geo-level (%s)", params$geo_type),
-        "Name",
-        sprintf("Total %s(s)", str_to_title(env_time_type)),
+        if (has_signal && multi_signal) "Indicator" else NULL,
+        sprintf("Location (%s)", params$geo_type),
+        "Periods with Values Reported",
+        "Possible Periods with Values",
         "Avg. Value",
         "% Missing"
     ),
     caption = sprintf(
-        "Summary statistics by location. Missingness is calculated against the full analysis window (%d periods).",
-        n_distinct(df_candidate$time_value)
+        "Summary statistics by location. Possible periods with values per location = %s %s period(s)%s = %s; %% missing is the share of those cells with no reported value.",
+        label_comma()(n_periods), env_time_type,
+        if (n_strata_cells > 1) sprintf(" x %s stratum cell(s)", label_comma()(n_strata_cells)) else "",
+        label_comma()(n_periods * n_strata_cells)
     ),
     rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-) %>% DT::formatRound(columns = if (multi_signal) 5 else 4, digits = 2)
+) %>% DT::formatRound(columns = which(names(summary_tbl) == "cand_mean"), digits = 2)
 ```
 
+:::
+
+### Time Series Overview
+
+The candidate `r ind` over time, one location at a time (use the dropdown to switch). Values are shown as published: the line breaks where a period has no value and each marker is one observation, so gaps read as gaps rather than as straight interpolated lines.
+
+```{r}
+#| label: eda-overview
+#| fig-height: 4
+#| results: asis
+all_geos <- sort(unique(df_candidate$geo_value))
+sample_geos <- random_sample(all_geos, min(length(all_geos), params$max_locations_plot))
+
+# Bands are drawn when the source reports bounds.
+ci_cols <- intersect(c("ci_lower", "ci_upper"), colnames(df_candidate))
+if (length(ci_cols) < 2) ci_cols <- NULL
+
+df_sample <- df_candidate %>%
+    as_tibble() %>%
+    filter(geo_value %in% sample_geos) %>%
+    # Fill the grid so missing periods become explicit NAs; plotly then leaves a
+    # gap instead of joining across them.
+    complete(nesting(!!!rlang::syms(c(signal_key, "time_value"))),
+             !!!rlang::syms(params$extra_keys), geo_value) %>%
+    add_indicator() %>%
+    # Name the dropdown entries; nothing downstream joins on the code.
+    mutate(geo_value = geo_to_name(geo_value))
+
+# One trace per indicator and, if present, per level of the first stratifier
+# (combined into a single key so both distinctions get their own legend entry).
+trace_parts <- c(if (multi_signal) "indicator" else NULL,
+                  if (length(params$extra_keys) > 0) params$extra_keys[1] else NULL)
+trace_col <- if (length(trace_parts) > 1) {
+    df_sample[[".trace"]] <- do.call(paste, c(unname(df_sample[trace_parts]), sep = " / "))
+    ".trace"
+} else if (length(trace_parts) == 1) trace_parts else NULL
+
+if (!is.null(ci_cols)) {
+    cat(sprintf(
+        "Shaded bands are the confidence interval reported with each value%s.\n\n",
+        if (!is.null(trace_col)) {
+            sprintf(", drawn in the colour of their %s and sharing its legend entry, so clicking one in the legend hides its line and its band together",
+                    if (length(trace_parts) > 1) paste(trace_parts, collapse = "/") else trace_col)
+        } else ""
+    ))
+}
+
+p <- plot_series_dropdown(df_sample, trace_col = trace_col, ci_cols = ci_cols)
+if (!is.null(p) && !is.null(attr(p, "bands_wide")) && attr(p, "bands_wide") > 0) {
+    cat(sprintf(
+        "An estimate on almost no denominator has an interval about as wide as the indicator itself, which drawn is a full-height column hiding every other series. %s of %s reported values (%s) have an interval wider than the full range of the values, so no band is drawn for them. Those observations still show as a line and a marker, and the y axis follows the values rather than the bands, so a band running off the top is clipped.\n\n",
+        label_comma()(attr(p, "bands_wide")), label_comma()(attr(p, "bands_total")),
+        label_percent(accuracy = 0.1)(attr(p, "bands_wide") / attr(p, "bands_total"))
+    ))
+}
+# SVG, not toWebGL: WebGL cannot fill a ribbon polygon and would break the
+# bands. Only one location shows at a time, so SVG is fast enough.
+if (!is.null(p)) p %>% plotly::partial_bundle()
+```
+
+::: {.content-visible when-meta="multi_location"}
+
+### Quantile Trends
+
+The distribution of the `r ind` across locations over time. The line is the median, the inner ribbon the 25th-75th percentile range (the middle 50% of locations), the outer ribbon the 5th-95th. Each panel has its own scale.
+
+Ribbon width is geographic variability: narrow means locations agree, wide means they spread.
+
+`r if (smooth_quantiles) "Quantiles are smoothed with a moving average, which is meant for raw data whose day-of-week effect would otherwise dominate the ribbons. An indicator already smoothed at the source does not need it, and smoothing twice only widens the effective window; set <code>smooth_quantiles: false</code> to plot the quantiles as published." else "Quantiles are plotted as published (<code>smooth_quantiles: false</code>). Set the parameter to <code>true</code> for raw data whose day-of-week effect would otherwise dominate the ribbons."`
+
+Each quantile covers only the locations that reported in that window, so panels with different location counts (shown in the panel labels) are not comparable. A spike in one panel alone is often composition: a location reporting only the aggregate stratum, on a small denominator, lifts that panel's upper quantile and no other.
+
+```{r}
+#| label: eda-quantiles
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 1.5), 15)
+#| eval: !expr n_locations > 1
+cat("\n")
+
+# One row per (key, period); geo_value is constant so epi_slide partitions by
+# the keys alone.
+df_quantiles_wide <- df_candidate %>%
+    group_by(across(all_of(c(strat_keys, "time_value")))) %>%
+    summarize(
+        vals = list(value),
+        geo_value = "all",
+        .groups = "drop"
+    ) %>%
+    as_epi_df(signal_format = "as_is", other_keys = strat_keys)
+
+# Smoothing window, matched to the time type.
+window_size <- switch(env_time_type %||% "unknown",
+    day   = 7L, # 7-day smoothing
+    week  = as.difftime(3, units = "weeks"), # 3-week smoothing
+    month = as.difftime(3, units = "months"), # 3-month smoothing
+    year  = as.difftime(3, units = "years"), # 3-year smoothing
+    Inf # Default to cumulative for unknown types
+    # (too sparse for sliding averages)
+)
+
+q_tbl <- function(v) {
+    tibble(
+        `0.05` = quantile(v, 0.05, na.rm = TRUE),
+        `0.25` = quantile(v, 0.25, na.rm = TRUE),
+        `0.5`  = quantile(v, 0.5, na.rm = TRUE),
+        `0.75` = quantile(v, 0.75, na.rm = TRUE),
+        `0.95` = quantile(v, 0.95, na.rm = TRUE)
+    )
+}
+
+df_quantiles_wide <- {
+    if (smooth_quantiles) {
+        df_quantiles_wide %>%
+            group_by(across(all_of(c("geo_value", strat_keys)))) %>%
+            epi_slide(~ q_tbl(unlist(.x$vals)), .window_size = window_size) %>%
+            ungroup()
+    } else {
+        # Quantiles of the values published in that period alone.
+        bind_cols(df_quantiles_wide, map_dfr(df_quantiles_wide$vals, q_tbl))
+    }
+} %>%
+    as_tibble() %>%
+    add_indicator() %>%
+    label_strata_coverage(params$extra_keys)
+
+ggplot(df_quantiles_wide, aes(x = time_value)) +
+    geom_ribbon(aes(ymin = `0.05`, ymax = `0.95`, fill = "5%-95%"), alpha = 0.2) +
+    geom_ribbon(aes(ymin = `0.25`, ymax = `0.75`, fill = "25%-75%"), alpha = 0.4) +
+    geom_line(aes(y = `0.5`, color = "Median"), linewidth = 1) +
+    facet_wrap(reformulate(c("indicator", params$extra_keys)), ncol = 1, scales = "free_y") +
+    scale_x_date(breaks = breaks_pretty(), label = label_date_short()) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_si(""))) +
+    scale_fill_manual(values = c("5%-95%" = dis_pal_list[2], "25%-75%" = dis_pal_list[2])) +
+    scale_color_manual(values = c("Median" = dis_pal_list[2])) +
+    labs(
+        title = if (smooth_quantiles) "Smoothed Quantile Trends" else "Quantile Trends",
+        subtitle = sprintf("Across the locations reporting each panel (of %d in total)%s",
+                           n_locations,
+                           if (smooth_quantiles) sprintf(", smoothed window: %s", format(window_size)) else ", as published"),
+        x = "Date", y = if (smooth_quantiles) "Value (smoothed)" else "Value",
+        fill = "Range", color = "Trend"
+    ) +
+    theme(legend.position = "bottom")
+```
+
+::: {.content-visible when-meta="geo_outliers"}
+
+#### Cross-Sectional Geographic Outliers
+
+The quantile plots summarize the body of the distribution and can hide erratic individual locations. This table places each one within it, counting how often the location sits above the 95th percentile or below the 5th for its own period and stratum. Both shares are out of the periods the location reported, not the analysis window, and the count of reported values is shown so a location with three observations is not read as a stable 100%.
+
+How to read it: 5% is where chance alone puts a location, so only distances from 5% carry information. A location above the 95th percentile most of the time is not having a long outbreak, it is sitting at a different level from everyone else. The same holds at the bottom, where a high zero share is the more common symptom. A location in *both* tails is unstable rather than high or low.
+
+::: {.callout-note}
+This compares locations against one another on each period, so it reports relative position only, never whether a value is correct. If the `r ind` `r sg_pl("relies", "rely")` on raw counts rather than rates or percentages, the table will mostly find the largest populations, reflecting size rather than outliers. Set `show_geo_outliers: false` to drop the section.
+:::
+
+```{r}
+#| label: eda-aberrant-locations
+#| echo: false
+#| results: asis
+#| eval: !expr (show_geo_outliers && n_locations > 1)
+# Only reported values take part: a location cannot be in a tail on a period it
+# never reported, and it should not be charged for one either.
+df_reported <- df_candidate %>%
+    as_tibble() %>%
+    filter(!is.na(value))
+
+# For a non-negative indicator the zero share is worth reporting alongside the
+# lower tail, since the 5th percentile is often zero itself.
+show_zero_share <- all(df_reported$value >= 0)
+
+# Cross-sectional tails per (indicator, stratum, period)
+daily_tails <- df_reported %>%
+    group_by(across(all_of(c(strat_keys, "time_value")))) %>%
+    summarize(
+        cand_p05 = quantile(value, 0.05),
+        cand_p95 = quantile(value, 0.95),
+        .groups = "drop"
+    )
+
+aberrant_locs <- df_reported %>%
+    left_join(daily_tails, by = c(strat_keys, "time_value")) %>%
+    group_by(across(all_of(c(strat_keys, "geo_value")))) %>%
+    summarize(
+        n_obs = n(),
+        upper_pct = 100 * mean(value > cand_p95),
+        lower_pct = 100 * mean(value < cand_p05),
+        zero_pct  = 100 * mean(value == 0),
+        .groups = "drop"
+    ) %>%
+    mutate(geo_value = geo_to_name(geo_value)) %>%
+    add_indicator() %>%
+    arrange(desc(upper_pct))
+
+if (nrow(aberrant_locs) > 0) {
+    aberrant_display <- aberrant_locs %>%
+        select(
+            any_of(if (has_signal && multi_signal) "indicator" else character(0)),
+            all_of(params$extra_keys), geo_value, n_obs,
+            upper_pct, lower_pct, any_of(if (show_zero_share) "zero_pct" else character(0))
+        )
+    DT::datatable(
+        aberrant_display,
+        colnames = c(
+            if (has_signal && multi_signal) "Indicator" else NULL,
+            str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+            "Location",
+            "Periods with Values Reported",
+            "% Above 95th",
+            "% Below 5th",
+            if (show_zero_share) "% Exactly Zero" else NULL
+        ),
+        caption = "Summary of aberrant locations (time spent in each tail, as a share of the periods the location reported).",
+        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+    ) %>% DT::formatRound(
+        columns = which(names(aberrant_display) %in% c("upper_pct", "lower_pct", "zero_pct")),
+        digits = 1
+    )
+} else {
+    cat("Insufficient data to calculate aberrant time for these locations.\n\n")
+}
+```
+
+:::
 
 
+:::
 
 
 ::: {.content-visible when-meta="multi_location"}
 
-### Noise Assessment
+### Temporal Variability
 
-We calculate the Coefficient of Variation (CV) for each location to compare indicator stability across geographic areas.
+The coefficient of variation (CV) measures how much the `r ind` `r sg_pl("moves", "move")` over time in each location. A high CV is not evidence of noise on its own: epidemic dynamics, seasonality and genuine level shifts all raise it. Read it as the size of the variation, use the seasonality and revision sections to judge how much of it is real, and treat it comparatively.
+
+The CV uses only reported values, so missing periods neither contribute nor count against it, and it is computed per (location, stratum). Pooling strata would measure the spread between them, since a location's strata usually sit at different levels.
+
+The CV is undefined for a location with a mean of zero or fewer than two values. Those series cannot appear in the histogram, so the caption counts them and the bars reconcile against the location count.
 
 $$\text{CV}_i = \frac{\text{SD}(X_i)}{|\bar{X}_i|}$$
 
 ```{r}
 #| label: eda-noise
-#| fig-height: !expr min(max(5, length(signals_vec)*0.5), 12)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 0.8), 12)
 #| eval: !expr n_locations > 1
-# Calculate CV per (signal, location)
+# One CV per (indicator, stratum, location), over reported values only
 noise_stats <- df_candidate %>%
-    arrange(signal, geo_value, time_value) %>%
-    group_by(signal, geo_value) %>%
+    as_tibble() %>%
+    filter(!is.na(value)) %>%
+    group_by(across(all_of(c(strat_keys, "geo_value")))) %>%
     summarize(
-        cand_cv = sd(value, na.rm = TRUE) / abs(mean(value, na.rm = TRUE)),
+        n_obs = n(),
+        cand_cv = sd(value) / abs(mean(value)),
         .groups = "drop"
-    ) %>%
-    filter(is.finite(cand_cv))
+    )
 
-# Clip extreme outliers for robust visualization
+n_series <- nrow(noise_stats)
+noise_undefined <- noise_stats %>% filter(!is.finite(cand_cv))
+noise_stats <- noise_stats %>% filter(is.finite(cand_cv))
+
+# Clip extreme outliers so the histogram stays readable
 cv_upper <- quantile(noise_stats$cand_cv, 0.99, na.rm = TRUE)
 noise_stats_plot <- noise_stats %>%
     filter(cand_cv <= cv_upper) %>%
-    mutate(signal_label = signal_labels[signal])
+    add_indicator() %>%
+    label_strata_coverage(params$extra_keys)
 
 n_excluded <- nrow(noise_stats) - nrow(noise_stats_plot)
 
-# Summary Table — one row per signal
+# Summary Table — one row per (indicator, stratum)
 noise_summary <- noise_stats %>%
-    group_by(signal) %>%
-    summarize(`Median CV` = median(cand_cv), .groups = "drop") %>%
-    mutate(Signal = signal_labels[signal]) %>%
-    select(Signal, `Median CV`)
+    group_by(across(all_of(strat_keys))) %>%
+    summarize(median_cv = median(cand_cv), n_locs = n_distinct(geo_value), .groups = "drop") %>%
+    mutate(across(all_of(params$extra_keys), order_strata)) %>%
+    add_indicator() %>%
+    arrange(across(all_of(params$extra_keys))) %>%
+    select(
+        any_of(if (has_signal && multi_signal) "indicator" else character(0)),
+        all_of(params$extra_keys), n_locs, median_cv
+    )
 
 DT::datatable(noise_summary,
-    caption = sprintf(
-        "CV summary across locations.%s",
-        if (n_excluded > 0) sprintf(" (%d extreme outlier(s) excluded from plot.)", n_excluded) else ""
+    colnames = c(
+        if (has_signal && multi_signal) "Indicator" else NULL,
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+        "Locations", "Median CV"
     ),
-    rownames = FALSE, options = list(scrollX = TRUE, paging = FALSE, dom = "t")
-) %>% DT::formatRound(columns = 2, digits = 3)
+    caption = sprintf(
+        "CV summary across locations. %d of %d (location%s) series have a defined CV%s%s.",
+        nrow(noise_stats), n_series,
+        if (length(params$extra_keys) > 0) " x stratum" else "",
+        if (nrow(noise_undefined) > 0) {
+            sprintf("; %d dropped as undefined (zero mean or a single reported value)", nrow(noise_undefined))
+        } else "",
+        if (n_excluded > 0) sprintf("; a further %d above the 99th percentile are excluded from the plot", n_excluded) else ""
+    ),
+    rownames = FALSE, options = list(scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
+) %>% DT::formatRound(columns = ncol(noise_summary), digits = 3)
 
-# Histogram (faceted by signal when multi_signal)
+# Histogram (faceted by indicator x stratum)
 ggplot(noise_stats_plot, aes(x = cand_cv)) +
     geom_histogram(bins = 30, color = "white", fill = dis_pal_list[2], alpha = 0.7) +
     scale_x_continuous(labels = label_percent()) +
-    {if (multi_signal) facet_wrap(~signal_label, scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
+    {if (multi_signal || length(params$extra_keys) > 0) facet_wrap(reformulate(c(if (multi_signal) "indicator", params$extra_keys)), scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
     labs(
         title = "CV Distribution by Location",
-        subtitle = "Lower values indicate a more stable indicator",
+        subtitle = "Higher values mean more variation over time, from real dynamics or from noise",
         x = "Coefficient of Variation (CV)", y = "Count"
     ) +
     theme(legend.position = "none")
@@ -958,7 +1372,6 @@ ggplot(noise_stats_plot, aes(x = cand_cv)) +
 ```{r}
 #| label: revision-analysis-setup
 #| echo: false
-#| dependson: "load-candidate-archive"
 # Get versioned data
 archive <- NULL
 archive_has_history <- FALSE
@@ -977,14 +1390,21 @@ if (!is.null(candidate_archive) &&
 
 
 
+::: {.content-visible when-meta="versioning"}
+
 ### Candidate Versioning
 
-This section examines how published values change over time as new data arrives. Each observation may be revised multiple times after its initial release, and the statistics below summarize both how often and how much those revisions occur. Relative revisions measure the magnitude of a revision relative to the signal's own scale. A relative revision of 0.1 means the observation shifted by 10% of its own magnitude across revisions, while values near 1 indicate revisions as large as the signal itself.
+Versioning is not the focus here. This section answers only whether the `r ind` `r sg_pl("revises", "revise")` at all and roughly how much. Relative revisions are scaled to the `r ind_poss` own magnitude: 0.1 means the observation shifted by 10% of its own size, and values near 1 mean revisions as large as the `r ind` `r sg_pl("itself", "themselves")`.
+
+::: {.callout-tip}
+For revision lags by location, convergence over time, and how much of the latest value is knowable at each lag, use `revision_analysis/revision_analysis.qmd`.
+:::
 
 ```{r}
 #| label: revision-analysis-text
 #| echo: false
 #| results: asis
+#| eval: !expr show_versioning
 if (is.null(archive)) {
     cat(sprintf(
         "No version history is available for `%s / %s` — versioning analysis is skipped.\n\n",
@@ -1010,195 +1430,76 @@ if (is.null(archive)) {
         ))
     }
 
-    # Helper: print revision stats block for one signal's rev_details
-    print_rev_stats <- function(rd, archive_obj) {
-        rb <- rd$revision_behavior
-        cat(sprintf(
-            "- **Time range**: %s to %s\n",
-            rd$range_time_values[1], rd$range_time_values[2]
-        ))
-        lag_stats <- summary(as.numeric(rb$min_lag, units = "days"))
-        cat("- **Min lag (days to first version)**: ")
-        cat(paste(names(lag_stats), round(as.numeric(lag_stats), 1), sep = ": ", collapse = ", "), "\n")
-        quick_threshold <- 3
-        few_threshold <- 3
-        rel_spread_threshold <- 0.1
-        abs_spread_threshold <- 0.05 * rd$max_val
-        no_rev_pct   <- mean(rb$n_revisions == 0)
-        quick_rev_pct <- mean(as.numeric(rb$max_lag, units = "days") <= quick_threshold)
-        few_rev_pct  <- mean(rb$n_revisions <= few_threshold)
-        cat(sprintf("- **Total number of versions**: %d\n", n_distinct(archive_obj$DT$version)))
-        cat(sprintf("- **No revisions**: %s\n", label_percent()(no_rev_pct)))
-        cat(sprintf("- **Quick revisions (<= %d days)**: %s\n", quick_threshold, label_percent()(quick_rev_pct)))
-        cat(sprintf("- **Few revisions (<= %d)**: %s\n", few_threshold, label_percent()(few_rev_pct)))
-        revised_beh <- rb %>% filter(n_revisions > 0)
-        if (nrow(revised_beh) > 0) {
-            low_rel_spread_pct  <- mean(revised_beh$rel_spread < rel_spread_threshold, na.rm = TRUE)
-            high_abs_spread_pct <- mean(revised_beh$spread > abs_spread_threshold, na.rm = TRUE)
-            cat(sprintf("- **Minor relative revisions (< %.1f)**: %s\n",
-                        rel_spread_threshold, label_percent()(low_rel_spread_pct)))
-            cat(sprintf("- **Major absolute revisions (> %.3f)**: %s\n",
-                        abs_spread_threshold, label_percent()(high_abs_spread_pct)))
-        }
-        cat(sprintf("- **Days until within %d%% of latest**: ", rd$within_latest * 100))
-        conv_stats <- summary(as.numeric(rb$lag_near_latest, units = "days"))
-        cat(paste(names(conv_stats), round(as.numeric(conv_stats), 1), sep = ": ", collapse = ", "), "\n\n")
+    # A revision is "quick" within 3 days, "few" at 3 or fewer, and its spread is
+    # minor below 10% of the observation (or major past 5% of the indicator's max).
+    quick_threshold <- 3
+    few_threshold <- 3
+    rel_spread_threshold <- 0.1
+    fmt_summary <- function(x) {
+        s <- summary(as.numeric(x, units = "days"))
+        paste(names(s), round(as.numeric(s), 1), sep = ": ", collapse = ", ")
     }
 
-    # Run revision_summary per signal so results are always signal-specific
-    rev_details_list <- list()
-    rev_beh_combined <- NULL
-
+    # Per indicator, so the statistics are never pooled across them. The
+    # stratifiers stay in the key: dropping them collapses one row per stratum
+    # onto the same (geo, period, version), which as_epi_archive() rejects.
     for (sig in signals_vec) {
         if (multi_signal) cat(sprintf("\n#### %s\n\n", signal_labels[sig]))
 
-        # Subset archive to this signal (drop signal col for revision_summary)
         sub_archive <- archive$DT %>%
             as_tibble() %>%
-            filter(signal == sig) %>%
-            select(geo_value, time_value, version, value) %>%
-            as_epi_archive()
+            filter_signal(sig) %>%
+            select(all_of(c("geo_value", "time_value", "version", params$extra_keys, "value"))) %>%
+            as_epi_archive(other_keys = params$extra_keys)
 
-        rd_sig <- revision_summary(sub_archive)
-        rev_details_list[[sig]] <- rd_sig
+        rd <- revision_summary(sub_archive)
+        rb <- rd$revision_behavior
+        abs_spread_threshold <- 0.05 * rd$max_val
 
-        # Accumulate combined revision_behavior with signal label
-        rev_beh_combined <- bind_rows(
-            rev_beh_combined,
-            rd_sig$revision_behavior %>% mutate(signal = sig)
-        )
+        cat(sprintf("- **Time range**: %s to %s\n", rd$range_time_values[1], rd$range_time_values[2]))
+        cat(sprintf("- **Min lag (days to first version)**: %s\n", fmt_summary(rb$min_lag)))
+        cat(sprintf("- **Total number of versions**: %d\n", n_distinct(sub_archive$DT$version)))
+        cat(sprintf("- **No revisions**: %s\n", label_percent()(mean(rb$n_revisions == 0))))
+        cat(sprintf("- **Quick revisions (<= %d days)**: %s\n", quick_threshold,
+                    label_percent()(mean(as.numeric(rb$max_lag, units = "days") <= quick_threshold))))
+        cat(sprintf("- **Few revisions (<= %d)**: %s\n", few_threshold,
+                    label_percent()(mean(rb$n_revisions <= few_threshold))))
 
-        print_rev_stats(rd_sig, sub_archive)
+        revised_beh <- rb %>% filter(n_revisions > 0)
+        if (nrow(revised_beh) > 0) {
+            cat(sprintf("- **Minor relative revisions (< %.1f)**: %s\n", rel_spread_threshold,
+                        label_percent()(mean(revised_beh$rel_spread < rel_spread_threshold, na.rm = TRUE))))
+            cat(sprintf("- **Major absolute revisions (> %.3f)**: %s\n", abs_spread_threshold,
+                        label_percent()(mean(revised_beh$spread > abs_spread_threshold, na.rm = TRUE))))
+        }
+        cat(sprintf("- **Days until within %d%% of latest**: %s\n\n",
+                    rd$within_latest * 100, fmt_summary(rb$lag_near_latest)))
     }
 
-    # Expose rev_details (first signal) for the visuals chunk; inject combined rev_behavior
-    rev_details <- rev_details_list[[signals_vec[1]]]
-    rev_details$revision_behavior <- rev_beh_combined
 }
 ```
 
-```{r}
-#| label: revision-analysis-visuals-text
-#| echo: false
-#| results: asis
-#| eval: !expr (archive_has_history && n_locations > 1)
-cat(sprintf("The time series below visualize the candidate indicator(s) (%s) with line colors corresponding to the issue date, meaning the date the data was initially published or subsequently revised. Darker colors denote older versions, while lighter colors represent more recent updates.\n\n", paste(name_vec, collapse = ", ")))
-cat("If the lines perfectly overlap, it means the data for that location is not subject to revisions. Where you see a vertical spread along a single date on the x-axis, the data has been revised over time.\n\n")
-```
-
-```{r}
-#| label: revision-analysis-visuals
-#| eval: !expr archive_has_history
-#| results: asis
-#| fig-height: !expr min(max(5, length(signals_vec)*1.5), 12)
-rev_by_loc <- rev_details$revision_behavior %>%
-    filter(n_revisions != 0) %>%
-    group_by(signal, geo_value) %>%
-    summarize(
-        n_versions = n(),
-        n_rev = mean(n_revisions, na.rm = TRUE),
-        min_lag = min(min_lag, na.rm = TRUE),
-        max_lag = max(max_lag, na.rm = TRUE),
-        spread = mean(spread, na.rm = TRUE),
-        rel_spread = mean(rel_spread, na.rm = TRUE),
-        lag_near_latest = mean(lag_near_latest, na.rm = TRUE),
-        .groups = "drop"
-    ) %>%
-    mutate(signal_label = signal_labels[signal]) %>%
-    arrange(desc(rel_spread))
-
-if (nrow(rev_by_loc) > 0) {
-    cat("The table below summarizes revision behavior per location. Column definitions:\n\n")
-    cat("- Min Lag. Minimum days between the event date and its first publication.\n")
-    cat("- Max Lag. Maximum days between the event date and its final revision.\n")
-    cat("- Avg. Spread. Average absolute difference between the minimum and maximum published values.\n")
-    cat("- Avg. Rel. Spread. Average relative difference between the minimum and maximum published values (spread divided by the maximum value).\n")
-    cat(sprintf("- Lag Near Latest. Average days until the value stays within %d%% of the latest published value.\n\n", rev_details$within_latest * 100))
-
-    rev_by_loc_display <- if (multi_signal) {
-        rev_by_loc %>% select(signal_label, geo_value, n_versions:lag_near_latest)
-    } else {
-        rev_by_loc %>% select(geo_value, n_versions:lag_near_latest)
-    }
-    DT::datatable(rev_by_loc_display,
-        colnames = c(
-            if (multi_signal) "Signal" else NULL,
-            "Location", "Versions", "Avg. Revisions", "Min Lag", "Max Lag",
-            "Avg. Spread", "Avg. Rel. Spread", "Lag Near Latest"
-        ),
-        caption = "Candidate revision behavior by location",
-        rownames = FALSE, options = list(scrollX = TRUE, scrollY = "400px", scrollCollapse = TRUE, paging = TRUE, dom = "tp")
-    ) %>% DT::formatRound(columns = if (multi_signal) 3:9 else 2:8, digits = 2)
-}
-
-if (nrow(rev_by_loc) > 0 && n_locations > 1) {
-    # Pick top locations by max rel_spread across signals
-    rev_geos <- rev_by_loc %>%
-        group_by(geo_value) %>%
-        summarize(rel_spread = max(rel_spread, na.rm = TRUE), .groups = "drop") %>%
-        arrange(desc(rel_spread)) %>%
-        #sample_geos
-        head(params$max_locations_plot) %>%
-        pull(geo_value)
-
-    # Limit to last year for clarity
-    # For multi-signal, loop per signal to avoid autoplot dropdown issues with
-    # the signal other-key (same pattern as eda-overview).
-    archive_filtered <- archive %>%
-        filter(geo_value %in% rev_geos) %>%
-        filter(time_value >= max(time_value) - years(1))
-
-    if (!multi_signal) {
-        n_geos_rev <- n_distinct(archive_filtered$DT$geo_value)
-        autoplot(archive_filtered, .versions = "month",
-            .interactive = TRUE, .facet_to_dropdown = n_geos_rev > 1) %>%
-            plotly::toWebGL() %>%
-            plotly::partial_bundle()
-    } else {
-        rev_plots <- purrr::map(signals_vec, function(sig) {
-            arch_sig_dt <- archive_filtered$DT %>%
-                as_tibble() %>%
-                filter(signal == sig) %>%
-                select(-signal)
-            if (nrow(arch_sig_dt) == 0) return(NULL)
-            arch_sig <- as_epi_archive(arch_sig_dt)
-            n_geos_sig <- n_distinct(arch_sig$DT$geo_value)
-            p <- autoplot(arch_sig, .versions = "month",
-                .interactive = TRUE, .facet_to_dropdown = n_geos_sig > 1) %>%
-                plotly::toWebGL() %>%
-                plotly::partial_bundle()
-            htmltools::tagList(
-                htmltools::tags$h5(signal_labels[sig]),
-                p
-            )
-        }) %>%
-            purrr::compact()
-        htmltools::tagList(rev_plots)
-    }
-}
-```
+:::
 
 
 
+### Indicator sanity checks
 
+These are hard to automate. Things to look for:
 
-### Signal sanity checks
+- Do the values match what you expected? This catches the most, and only you can make the call: state the range, level and shape you expect from the `r ind_poss` definition before reading the plots, then compare.
+- If it's a percentage or percentile, is it between 0 and 100?
+- If it's a count, does it scale with population? One that doesn't points at a coverage or denominator problem. A rate or percentage is already normalized, so its level should instead be comparable across locations of very different sizes, and one far off the rest is worth investigating. The relevant denominator is usually not the resident population but the part the source observes.
+- Are the values plausible? A percentage approaching 100 outside a pandemic, for instance.
+- For a seasonal disease, are rates highest in winter and lowest in summer?
+- Do the coarser geographies aggregate plausibly?
 
-This section is by its nature more difficult than others to do systematically. Things to look for:
-
-- If it's a percentile, is it between 0 and 100?
-- If it's a rate, is it roughly proportional to population? *(requires external population data — inspect manually)*
-- Are the actual values reasonable? E.g. if it's a percentage, does it ever approach 100 outside of literal pandemics?
-- If it's for a seasonal disease, are rates highest in the winter and lowest in the summer?
-- Are geo-aggregated coarser levels plausible aggregations? *(checked below for state-level indicators vs HHS/nation)*
-
-The histogram and table below show the distribution of all observed values and the value range per location for the candidate indicator, to assess whether the range is plausible given the indicator's expected scale.
+The `r sg_pl("histogram", "histograms")` and table below show the distribution of all values and the range per location, to judge whether that range fits the `r ind_poss` expected scale.
 
 ```{r}
 #| label: sanity-value-range
-#| fig-height: !expr min(max(5, length(signals_vec)*0.5), 12)
-df_candidate_plot <- df_candidate %>%
-    mutate(indicator = signal_labels[signal])
+#| fig-height: !expr min(max(5, length(signals_vec) * 0.5), 12)
+df_candidate_plot <- df_candidate %>% add_indicator()
 
 ggplot(df_candidate_plot, aes(x = value)) +
     geom_histogram(bins = 40, alpha = 0.8, color = "white") +
@@ -1206,10 +1507,10 @@ ggplot(df_candidate_plot, aes(x = value)) +
     scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
     {if (multi_signal) facet_wrap(~indicator, scales = "free", labeller = label_wrap_html(width = 25)) else NULL} +
     labs(
-        title = if (multi_signal) "Value distribution by signal"
+        title = if (multi_signal) "Value distribution by indicator"
                 else sprintf("Value distribution: %s", signal_labels[signals_vec]),
         subtitle = sprintf(
-            "%s observations across %d locations",
+            "%s reported values across %d locations",
             label_comma()(nrow(df_candidate)), n_locations
         ),
         x = "Value", y = "Count"
@@ -1220,27 +1521,34 @@ ggplot(df_candidate_plot, aes(x = value)) +
 #| label: sanity-value-range-table
 #| echo: false
 range_tbl <- df_candidate %>%
-    group_by(signal, geo_value) %>%
+    as_tibble() %>%
+    filter(!is.na(value)) %>%
+    group_by(across(all_of(c(strat_keys, "geo_value")))) %>%
     summarize(
         n = n(),
-        min = min(value, na.rm = TRUE),
-        p05 = quantile(value, 0.05, na.rm = TRUE),
-        median = median(value, na.rm = TRUE),
-        p95 = quantile(value, 0.95, na.rm = TRUE),
-        max = max(value, na.rm = TRUE),
+        min = min(value),
+        p05 = quantile(value, 0.05),
+        median = median(value),
+        p95 = quantile(value, 0.95),
+        max = max(value),
         .groups = "drop"
     ) %>%
-    mutate(signal_label = signal_labels[signal]) %>%
+    mutate(
+        across(all_of(params$extra_keys), order_strata),
+        geo_value = geo_to_name(geo_value)
+    ) %>%
+    add_indicator() %>%
     arrange(desc(max)) %>%
-    {
-        if (multi_signal) select(., signal_label, geo_value, n:max)
-        else select(., geo_value, n:max)
-    }
+    select(
+        any_of(if (has_signal && multi_signal) "indicator" else character(0)),
+        all_of(params$extra_keys), geo_value, n:max
+    )
 
 DT::datatable(
     range_tbl,
     colnames = c(
-        if (multi_signal) "Signal" else NULL,
+        if (has_signal && multi_signal) "Indicator" else NULL,
+        str_to_title(str_replace_all(params$extra_keys, "_", " ")),
         "Location", "N", "Min", "5th pct", "Median", "95th pct", "Max"
     ),
     caption = sprintf(
@@ -1252,29 +1560,21 @@ DT::datatable(
         scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
         paging = TRUE, dom = "tp"
     )
-) %>% DT::formatRound(columns = if (multi_signal) 4:8 else 3:7, digits = 3)
+) %>% DT::formatRound(columns = which(names(range_tbl) %in% c("min", "p05", "median", "p95", "max")), digits = 3)
 ```
 
-The plot below shows the seasonal pattern of the indicator, with each panel representing one epidemiological year (June–May). The line traces the monthly median across all locations, the inner band covers the interquartile range, and the outer band spans the full observed range.
+The seasonal pattern of the `r ind`, one panel per epidemiological year (`r season_label`). The line is the monthly median across locations, the inner band the 25th-75th percentile range (the middle 50% of that month's observations), the outer band the full min-max range.
+
+The year boundary comes from `season_start_month`, which defaults to July so a northern-hemisphere respiratory season falls inside one panel, following the usual influenza convention. Set another month for indicators peaking elsewhere in the year.
 
 ```{r}
 #| label: sanity-seasonality
-#| fig-height: !expr min(max(5, length(signals_vec)*2.5), 15)
+#| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 2.5), 15)
 #| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
-
-season_month_labels <- function(x) {
-c("Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May")[x]
-}
-
 df_seasonal <- df_candidate %>%
-    mutate(
-        yr = as.integer(format(time_value, "%Y")),
-        month = as.integer(format(time_value, "%m")),
-        season_start = if_else(month >= 6L, yr, yr - 1L),
-        season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L)),
-        season_month = if_else(month >= 6L, month - 5L, month + 7L)
-    ) %>%
-    group_by(signal, season, season_month) %>%
+    as_tibble() %>%
+    add_season() %>%
+    group_by(across(all_of(c(strat_keys, "season", "season_month")))) %>%
     summarize(
         median_val = median(value, na.rm = TRUE),
         min_val = min(value, na.rm = TRUE),
@@ -1283,12 +1583,13 @@ df_seasonal <- df_candidate %>%
         p75 = quantile(value, 0.75, na.rm = TRUE),
         .groups = "drop"
     ) %>%
-    # Keep only signal-season combos with >= 3 months of data
+    # Keep only (key x season) combos with >= 3 months of data
     semi_join(
-        count(., signal, season) %>% filter(n >= 3),
-        by = c("signal", "season")
+        count(., across(all_of(c(strat_keys, "season")))) %>% filter(n >= 3),
+        by = c(strat_keys, "season")
     ) %>%
-    mutate(signal_label = signal_labels[signal])
+    add_indicator() %>%
+    label_strata_coverage(params$extra_keys)
 
 ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group = season)) +
     geom_ribbon(aes(ymin = min_val, ymax = max_val), alpha = 0.10, linewidth = 0.2) +
@@ -1296,15 +1597,19 @@ ggplot(df_seasonal, aes(x = season_month, color = season, fill = season, group =
     geom_line(aes(y = median_val), linewidth = 0.8) +
     geom_point(aes(y = median_val), size = 1.5) +
     {
-        if (multi_signal) facet_grid(signal_label ~ season, scales = "free_y")
-        else facet_wrap(~season, ncol = 2, scales = "free_y")
+        row_vars <- c(if (multi_signal) "indicator", params$extra_keys)
+        if (length(row_vars) > 0) {
+            facet_grid(as.formula(paste(paste(row_vars, collapse = " + "), "~ season")), scales = "free_y")
+        } else {
+            facet_wrap(~season, ncol = 2, scales = "free_y")
+        }
     } +
-    scale_x_continuous(labels = season_month_labels) +
+    scale_x_continuous(labels = ~ month.abb[((season_start_month - 2L + .x) %% 12L) + 1L]) +
     scale_y_continuous(labels = label_number(scale_cut = cut_si(""))) +
     labs(
-        title = if (multi_signal) "Seasonal patterns by signal"
+        title = if (multi_signal) "Seasonal patterns by indicator"
                 else sprintf("Seasonal pattern: %s", signal_labels[signals_vec]),
-        subtitle = "Median by month across all locations — inner band: IQR, outer band: full range",
+        subtitle = "Median by month across all locations — inner band: 25th-75th pct, outer band: min-max",
         x = "Month", y = "Median value"
     ) +
     theme(legend.position = "none")
@@ -1369,35 +1674,50 @@ fetch_coarser_candidate <- function(geo_type_coarser) {
     )
 }
 
+# The HHS/nation series is unstratified, so only the aggregate stratum is
+# comparable. Pooling every stratum widens the bounds until nothing can fall
+# outside them and turns the state count into a row count.
+agg_stratum <- map(set_names(params$extra_keys), function(k) {
+    lv <- unique(as.character(df_candidate[[k]]))
+    lv[tolower(lv) %in% agg_level_names][1]
+})
+strata_comparable <- all(!is.na(unlist(agg_stratum))) || length(params$extra_keys) == 0
+
 state_vals <- df_candidate %>%
     as_tibble() %>%
-    select(signal, time_value, state_geo = geo_value, state_val = value)
+    {
+        if (strata_comparable) reduce(params$extra_keys, function(d, k) filter(d, .data[[k]] == agg_stratum[[k]]), .init = .)
+        else .
+    } %>%
+    select(all_of(signal_key), time_value, state_geo = geo_value, state_val = value)
 
 check_aggregation <- function(df_coarser, group_label, state_to_coarser) {
-    if (is.null(df_coarser)) {
+    if (is.null(df_coarser) || !strata_comparable) {
         return(NULL)
     }
+    # No signal column means a single indicator, so match on period and geo.
+    if (!has_signal) df_coarser <- df_coarser %>% select(-any_of("signal"))
 
     state_bounds <- state_vals %>%
         inner_join(state_to_coarser, by = "state_geo") %>%
-        group_by(signal, time_value, coarser_geo) %>%
+        group_by(across(all_of(c(signal_key, "time_value", "coarser_geo")))) %>%
         summarize(
             state_min = min(state_val, na.rm = TRUE),
             state_max = max(state_val, na.rm = TRUE),
-            n_states  = n(),
+            n_states  = n_distinct(state_geo),
             .groups   = "drop"
         )
 
     df_coarser %>%
         rename(coarser_geo = geo_value) %>%
-        inner_join(state_bounds, by = c("signal", "time_value", "coarser_geo")) %>%
+        inner_join(state_bounds, by = c(signal_key, "time_value", "coarser_geo")) %>%
         filter(!is.na(coarser_val) & (coarser_val < state_min - 1e-9 | coarser_val > state_max + 1e-9)) %>%
+        add_indicator() %>%
         mutate(
-            geo_level    = group_label,
-            signal_label = signal_labels[signal],
-            direction    = if_else(coarser_val < state_min, "below min", "above max")
+            geo_level = group_label,
+            direction = if_else(coarser_val < state_min, "below min", "above max")
         ) %>%
-        select(geo_level, signal_label, time_value, coarser_geo, coarser_val, state_min, state_max, direction, n_states)
+        select(geo_level, indicator, time_value, coarser_geo, coarser_val, state_min, state_max, direction, n_states)
 }
 
 df_hhs_raw <- fetch_coarser_candidate("hhs")
@@ -1426,10 +1746,27 @@ if (length(unavailable) > 0) {
     ))
 }
 
-if (nrow(violations) == 0) {
+# Which slice of the state data the coarser values were compared against.
+strata_note <- if (length(params$extra_keys) == 0 || !strata_comparable) {
+    ""
+} else {
+    sprintf(" The comparison uses the aggregate stratum (%s), the only one the unstratified HHS/nation series corresponds to.",
+            paste(sprintf("%s = %s", names(agg_stratum), unlist(agg_stratum)), collapse = ", "))
+}
+
+if (!strata_comparable) {
     cat(sprintf(
-        "No geo-aggregation violations found: all HHS/nation values are within the [min, max] of constituent state values for %s.\n",
-        paste(name_vec, collapse = ", ")
+        "**Note**: geo-aggregation check skipped. The HHS/nation series is not stratified, so it can only be compared against an aggregate level of %s, and none of the levels present (%s) is one.\n",
+        paste(params$extra_keys, collapse = "/"),
+        paste(map_chr(params$extra_keys, ~ paste(unique(as.character(df_candidate[[.x]])), collapse = ", ")), collapse = "; ")
+    ))
+} else if (length(unavailable) == 2) {
+    # Nothing to compare against, so this is not a clean bill of health.
+    cat("No coarser series was available, so the geo-aggregation check did not run.\n")
+} else if (nrow(violations) == 0) {
+    cat(sprintf(
+        "No geo-aggregation violations found: all HHS/nation values are within the [min, max] of constituent state values for %s.%s\n",
+        paste(name_vec, collapse = ", "), strata_note
     ))
 } else {
     cat(sprintf(
@@ -1440,7 +1777,7 @@ if (nrow(violations) == 0) {
     print(htmltools::tagList(
         DT::datatable(
             violations,
-            colnames = c("Level", "Signal", "Date", "Geo", "Agg Value", "State Min", "State Max", "Direction", "N States"),
+            colnames = c("Level", "Indicator", "Date", "Geo", "Agg Value", "State Min", "State Max", "Direction", "N States"),
             caption = sprintf(
                 "Geo-aggregation bounds check for %s. Aggregated values should fall within [min, max] of constituent state values.",
                 paste(name_vec, collapse = ", ")
@@ -1466,31 +1803,29 @@ The table below flags locations whose seasonal peak is at least twice the typica
 #| echo: false
 #| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
 df_seasonal_loc <- df_candidate %>%
-    mutate(
-        yr = as.integer(format(time_value, "%Y")),
-        month = as.integer(format(time_value, "%m")),
-        season_start = if_else(month >= 6L, yr, yr - 1L),
-        season = paste0(season_start, "-", substr(as.character(season_start + 1L), 3L, 4L))
-    ) %>%
-    group_by(signal, season, geo_value) %>%
+    as_tibble() %>%
+    add_season() %>%
+    group_by(across(all_of(c(strat_keys, "season", "geo_value")))) %>%
     summarize(loc_max = max(value, na.rm = TRUE), .groups = "drop")
 
 typical_max <- df_seasonal_loc %>%
-    group_by(signal, season) %>%
+    group_by(across(all_of(c(strat_keys, "season")))) %>%
     summarize(typical_max = median(loc_max, na.rm = TRUE), .groups = "drop")
 
 anomalies <- df_seasonal_loc %>%
-    left_join(typical_max, by = c("signal", "season")) %>%
+    left_join(typical_max, by = c(strat_keys, "season")) %>%
     mutate(
-        ratio        = loc_max / typical_max,
-        signal_label = signal_labels[signal]
+        ratio = loc_max / typical_max,
+        across(all_of(params$extra_keys), order_strata),
+        geo_value = geo_to_name(geo_value)
     ) %>%
+    add_indicator() %>%
     filter(ratio >= 2) %>%
     arrange(desc(ratio)) %>%
-    {
-        if (multi_signal) select(., signal_label, season, geo_value, loc_max, typical_max, ratio)
-        else select(., season, geo_value, loc_max, typical_max, ratio)
-    }
+    select(
+        any_of(if (has_signal && multi_signal) "indicator" else character(0)),
+        all_of(params$extra_keys), season, geo_value, loc_max, typical_max, ratio
+    )
 
 if (nrow(anomalies) == 0) {
     cat("No locations found with a seasonal max more than 2x the typical (median) seasonal max.")
@@ -1498,7 +1833,8 @@ if (nrow(anomalies) == 0) {
     DT::datatable(
         anomalies,
         colnames = c(
-            if (multi_signal) "Signal" else NULL,
+            if (has_signal && multi_signal) "Indicator" else NULL,
+            str_to_title(str_replace_all(params$extra_keys, "_", " ")),
             "Season", "Location", "Location Max", "Typical Max", "Ratio"
         ),
         caption = sprintf(
@@ -1510,6 +1846,6 @@ if (nrow(anomalies) == 0) {
             scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
             paging = TRUE, pageLength = 20, dom = "tp"
         )
-    ) %>% DT::formatRound(columns = if (multi_signal) 4:6 else 3:5, digits = 3)
+    ) %>% DT::formatRound(columns = which(names(anomalies) %in% c("loc_max", "typical_max", "ratio")), digits = 3)
 }
 ```
