@@ -2,10 +2,11 @@
 
 This directory contains scripts and notebooks for evaluating candidate epidemic indicators (either from the Delphi Epidata API or local CSV files) and comparing them against guiding indicators.
 
-The analysis is split into two notebooks:
+The analysis is split into three notebooks:
 
 1. [indicator_evaluation.qmd](indicator_evaluation.qmd) performs a candidate-only exploratory data analysis (EDA). It evaluates one or more signals of a single candidate indicator to understand its characteristics, coverage, missingness, and versioning/revision behavior.
 2. [indicator_correlation.qmd](indicator_correlation.qmd) compares a single candidate indicator against a guiding indicator (presumed ground truth) to assess its nowcasting/forecasting value via EDA overlays and correlation/lag analyses.
+3. [indicator_multi_comparison.qmd](indicator_multi_comparison.qmd) compares one candidate indicator against multiple reference indicators in a single report. References are evaluated pairwise and are not combined.
 
 ## Installation
 
@@ -137,6 +138,40 @@ quarto::quarto_render(
 )
 ```
 
+### 3. Multi-Reference Indicator Comparison (`indicator_analysis/indicator_multi_comparison.qmd`)
+
+Use this notebook when one candidate indicator should be screened against several reference indicators at once. Each reference is compared pairwise with the candidate.
+
+From R:
+
+```r
+quarto::quarto_render(
+  "indicator_analysis/indicator_multi_comparison.qmd",
+  execute_params = list(
+    candidate_source = "doctor-visits",
+    candidate_indicator = "smoothed_adj_cli",
+    candidate_name = "Doctor Visits: Smoothed Adj CLI",
+    reference_sources = c("quidel", "hospital-admissions", "chng", "chng"),
+    reference_indicators = c(
+      "covid_ag_smoothed_pct_positive",
+      "smoothed_covid19_from_claims",
+      "7dav_inpatient_covid",
+      "7dav_outpatient_covid"
+    ),
+    reference_names = c(
+      "Quidel: Smoothed % Positive COVID Antigen",
+      "Hospital Admissions: Smoothed COVID-19 from Claims",
+      "CHNG: 7-day Avg Inpatient COVID",
+      "CHNG: 7-day Avg Outpatient COVID"
+    ),
+    geo_type = "state",
+    time_type = "day",
+    start_day = "2020-09-01",
+    end_day = "2023-03-01"
+  )
+)
+```
+
 ### Using the Batch Script
 
 You can use the provided example scripts in this directory rather than long `quarto` strings in the terminal.
@@ -191,6 +226,27 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | `max_archive_locs` | Max locations for version history | `60` | Optional |
 | `min_archive_days` | Min days of history for revision analysis | `60` | Optional |
 
+### Parameters for `indicator_analysis/indicator_multi_comparison.qmd`
+
+| Parameter | Description | Default | Requirement |
+| --- | --- | --- | --- |
+| `candidate_source` | Candidate indicator data source | — | Required for API; optional for CSV |
+| `candidate_indicator` | Candidate indicator name | — | Required for API; optional for CSV |
+| `candidate_name` | Display label for the candidate indicator | — | Required |
+| `candidate_csv` | Path to local candidate CSV | `NULL` | Required for CSV |
+| `reference_sources` | Vector of reference indicator data sources | `character()` | Required for API references |
+| `reference_indicators` | Vector of reference indicator names | `character()` | Required for API references |
+| `reference_names` | Display labels for reference indicators | `character()` | Required |
+| `reference_csvs` | Vector of local reference CSV paths | `NULL` | Required for CSV references |
+| `extra_keys` | Extra key columns beyond `geo_value`/`time_value` for stratification | `character()` | Optional |
+| `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | — | Required |
+| `time_type` | Time resolution (`day`, `week`, `month`) | — | Required |
+| `start_day` | Start date (YYYY-MM-DD) | — | Required |
+| `end_day` | End date (YYYY-MM-DD) | — | Required |
+| `max_locations_plot` | Max locations in plots/tables | `12` | Optional |
+| `api_timeout_seconds` | Epidata request timeout in seconds | `60` | Optional |
+| `api_chunk_days` | Days per chunk for legacy API requests | `30` | Optional |
+
 ---
 
 ## Using Local Data (CSV)
@@ -199,6 +255,7 @@ To run the analysis with local CSV files instead of querying the Epidata API, sp
 
 - For `indicator_analysis/indicator_evaluation.qmd`, set the `input_csv` parameter.
 - For `indicator_analysis/indicator_correlation.qmd`, set the `guiding_csv` and/or `candidate_csv` parameters.
+- For `indicator_analysis/indicator_multi_comparison.qmd`, set `candidate_csv` and/or `reference_csvs`.
 
 Other API parameters (such as `source`, `signal`, and display names) serve as optional label overrides to customize titles and legends in the plots. If omitted, they default to the CSV filename and column names.
 

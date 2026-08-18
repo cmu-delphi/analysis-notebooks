@@ -7,6 +7,7 @@ This repository hosts a collection of notebooks and reports for epidemiological 
 
 ## Indicator Evaluation
 - [HHS vs. Doctor Visits (State)](indicator_analysis/eval_hhs_vs_doctor_visits_api_state.html)
+- [Doctor Visits vs. Multiple References (State)](indicator_analysis/indicator_multi_comparison.html)
 - [Confirmed Incidence vs. Doctor Visits (County)](indicator_analysis/eval_confirmed_incidence_num_vs_doctor_visits_api_county.html)
 
 ## Revision Analysis
