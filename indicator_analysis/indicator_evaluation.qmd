@@ -140,7 +140,7 @@ if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delph
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess,
-    tidyverse, scales, patchwork,
+    tidyverse, stringr, scales, patchwork,
     here, glue, ggtext
 )
 # Custom HTML-friendly label wrapper for ggtext::element_markdown
@@ -1491,7 +1491,7 @@ These are hard to automate. Things to look for:
 - If it's a percentage or percentile, is it between 0 and 100?
 - If it's a count, does it scale with population? One that doesn't points at a coverage or denominator problem. A rate or percentage is already normalized, so its level should instead be comparable across locations of very different sizes, and one far off the rest is worth investigating. The relevant denominator is usually not the resident population but the part the source observes.
 - Are the values plausible? A percentage approaching 100 outside a pandemic, for instance.
-- For a seasonal disease, are rates highest in winter and lowest in summer?
+- For a seasonal disease, do rates vary as expected?
 - Do the coarser geographies aggregate plausibly?
 
 The `r sg_pl("histogram", "histograms")` and table below show the distribution of all values and the range per location, to judge whether that range fits the `r ind_poss` expected scale.

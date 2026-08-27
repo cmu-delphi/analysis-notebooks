@@ -88,7 +88,7 @@ if (!requireNamespace("epidatr", quietly = TRUE)) pak::pkg_install("cmu-delphi/e
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess, covidcast,
-    tidyverse, scales, patchwork,
+    tidyverse, stringr, scales, patchwork,
     here, glue, DT, rlang
 )
 

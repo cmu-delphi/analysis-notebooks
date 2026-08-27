@@ -153,7 +153,7 @@ if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delph
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess,
-    tidyverse, scales, patchwork,
+    tidyverse, stringr, scales, patchwork,
     here, glue, ggtext
 )
 
