@@ -18,7 +18,7 @@
     "href": "va.html#va-covid-cases100k",
     "title": "VA Examples",
     "section": "VA COVID Cases/100k",
-    "text": "VA COVID Cases/100k\n\nState: VA COVID Cases/100k\nMSA: VA COVID Cases/100k"
+    "text": "VA COVID Cases/100k\n\nMSA: VA COVID Cases/100k"
   },
   {
     "objectID": "va.html#va-respiratory-candidate-eda",
@@ -33,13 +33,6 @@
     "title": "VA Examples",
     "section": "VA Respiratory: vs References",
     "text": "VA Respiratory: vs References\n\nState: COVID vs References\nMSA: COVID vs References\nState: Flu vs References\nMSA: Flu vs References\nState: RSV vs References\nMSA: RSV vs References"
-  },
-  {
-    "objectID": "va.html#va-respiratory-overview",
-    "href": "va.html#va-respiratory-overview",
-    "title": "VA Examples",
-    "section": "VA Respiratory: Overview",
-    "text": "VA Respiratory: Overview\n\nState: Pathogens by State"
   },
   {
     "objectID": "index.html",
