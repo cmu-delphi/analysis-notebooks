@@ -28,6 +28,13 @@
     "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
   },
   {
+    "objectID": "index.html#va-examples",
+    "href": "index.html#va-examples",
+    "title": "Rapid SCAN",
+    "section": "VA Examples",
+    "text": "VA Examples\n\nVA COVID Cases/100k\n\nState: VA COVID Cases/100k\nMSA: VA COVID Cases/100k\n\n\n\nVA Respiratory: Candidate EDA\n\nState: Cases (Cumulative)\nMSA: Cases (Cumulative)\nState: Cases (Rate)\nMSA: Cases (Rate)\nState: Vaccines (Cumulative)\nState: Vaccines (Per 100k)\n\n\n\nVA Respiratory: vs References\n\nState: COVID vs References\nMSA: COVID vs References\nState: Flu vs References\nMSA: Flu vs References\nState: RSV vs References\nMSA: RSV vs References\n\n\n\nVA Respiratory: Overview\n\nState: Pathogens by State"
+  },
+  {
     "objectID": "vignettes/eval_hhs_vs_doctor_visits_api_state.html",
     "href": "vignettes/eval_hhs_vs_doctor_visits_api_state.html",
     "title": "Doctor Visits (HHS) Indicator Analysis",
