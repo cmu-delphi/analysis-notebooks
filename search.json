@@ -7,6 +7,41 @@
     "text": "This page provides access to the exploratory data analysis and comparative evaluation reports for doctor visits indicators.\n\n\n Candidate EDA\nEvaluation of the Doctor Visits: Smoothed Adj CLI signal.\n\n View Candidate EDA Report\nExploratory analysis of the candidate indicator’s spatial and temporal coverage, missingness, and data distributions across US counties.\n\n\n\n County Comparison\nComparison against the JHU COVID-19 Cases guiding indicator.\n\n View JHU Cases Comparison Report\nDetailed comparative analysis assessing correlations, lead/lag relationships, and back-revision behavior against JHU Cases data."
   },
   {
+    "objectID": "va.html",
+    "href": "va.html",
+    "title": "VA Examples",
+    "section": "",
+    "text": "Reports generated from the VA data pipelines."
+  },
+  {
+    "objectID": "va.html#va-covid-cases100k",
+    "href": "va.html#va-covid-cases100k",
+    "title": "VA Examples",
+    "section": "VA COVID Cases/100k",
+    "text": "VA COVID Cases/100k\n\nState: VA COVID Cases/100k\nMSA: VA COVID Cases/100k"
+  },
+  {
+    "objectID": "va.html#va-respiratory-candidate-eda",
+    "href": "va.html#va-respiratory-candidate-eda",
+    "title": "VA Examples",
+    "section": "VA Respiratory: Candidate EDA",
+    "text": "VA Respiratory: Candidate EDA\n\nState: Cases (Cumulative)\nMSA: Cases (Cumulative)\nState: Cases (Rate)\nMSA: Cases (Rate)\nState: Vaccines (Cumulative)\nState: Vaccines (Per 100k)"
+  },
+  {
+    "objectID": "va.html#va-respiratory-vs-references",
+    "href": "va.html#va-respiratory-vs-references",
+    "title": "VA Examples",
+    "section": "VA Respiratory: vs References",
+    "text": "VA Respiratory: vs References\n\nState: COVID vs References\nMSA: COVID vs References\nState: Flu vs References\nMSA: Flu vs References\nState: RSV vs References\nMSA: RSV vs References"
+  },
+  {
+    "objectID": "va.html#va-respiratory-overview",
+    "href": "va.html#va-respiratory-overview",
+    "title": "VA Examples",
+    "section": "VA Respiratory: Overview",
+    "text": "VA Respiratory: Overview\n\nState: Pathogens by State"
+  },
+  {
     "objectID": "index.html",
     "href": "index.html",
     "title": "Rapid SCAN",
@@ -26,13 +61,6 @@
     "title": "Rapid SCAN",
     "section": "Revision Analysis",
     "text": "Revision Analysis\n\nState: Hospital Admissions (Smoothed COVID-19 from Claims)"
-  },
-  {
-    "objectID": "index.html#va-examples",
-    "href": "index.html#va-examples",
-    "title": "Rapid SCAN",
-    "section": "VA Examples",
-    "text": "VA Examples\n\nVA COVID Cases/100k\n\nState: VA COVID Cases/100k\nMSA: VA COVID Cases/100k\n\n\n\nVA Respiratory: Candidate EDA\n\nState: Cases (Cumulative)\nMSA: Cases (Cumulative)\nState: Cases (Rate)\nMSA: Cases (Rate)\nState: Vaccines (Cumulative)\nState: Vaccines (Per 100k)\n\n\n\nVA Respiratory: vs References\n\nState: COVID vs References\nMSA: COVID vs References\nState: Flu vs References\nMSA: Flu vs References\nState: RSV vs References\nMSA: RSV vs References\n\n\n\nVA Respiratory: Overview\n\nState: Pathogens by State"
   },
   {
     "objectID": "vignettes/eval_hhs_vs_doctor_visits_api_state.html",
