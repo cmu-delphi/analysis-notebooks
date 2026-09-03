@@ -363,7 +363,7 @@ DT::datatable(config_tbl, caption = caption_str, rownames = FALSE, options = lis
 #| output: asis
 # Load guiding indicator
 if (!is.null(params$guiding_csv)) {
-    df_guiding <- read.csv(params$guiding_csv) %>%
+    df_guiding <- read.csv(params$guiding_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
         filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day)) %>%
         as_epi_df()
@@ -428,7 +428,7 @@ cat(sprintf(
 # Load candidate indicator
 candidate_archive <- NULL
 if (!is.null(params$candidate_csv)) {
-    df_candidate_raw <- read.csv(params$candidate_csv) %>%
+    df_candidate_raw <- read.csv(params$candidate_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
         filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day))
 

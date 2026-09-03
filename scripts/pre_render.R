@@ -180,3 +180,20 @@ if (!all(file.exists(va_outputs))) {
 } else {
   message("Skipping existing VA COVID Cases/100k reports")
 }
+
+# 10. VA Respiratory: EDA (Cases & Vaccines), Correlation by Pathogen, Combined Pathogen Plot
+va_respiratory_outputs <- here::here("examples", "va-respiratory", c(
+  outer(c("eval_va_respiratory_cases_cumulative", "eval_va_respiratory_cases_rate"), c("state", "msa"), paste, sep = "_"),
+  # Vaccine signals aren't published at msa granularity.
+  c("eval_va_respiratory_vaccines_cumulative_state", "eval_va_respiratory_vaccines_per_100k_state"),
+  # Correlation is state-only (msa lacks a second reference geo).
+  paste0("multi_comparison_va_respiratory_", c("covid", "flu", "rsv"), "_state"),
+  "va_respiratory_pathogens_state"
+))
+va_respiratory_outputs <- paste0(va_respiratory_outputs, ".html")
+if (!all(file.exists(va_respiratory_outputs))) {
+  message("Generating missing VA Respiratory reports")
+  source(here::here("examples", "va-respiratory", "va-respiratory-analysis.R"))
+} else {
+  message("Skipping existing VA Respiratory reports")
+}

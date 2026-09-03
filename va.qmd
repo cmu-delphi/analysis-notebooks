@@ -1,0 +1,19 @@
+---
+title: "VA Examples"
+toc: false
+---
+
+Reports generated from the VA data pipelines.
+
+## VA Respiratory: Candidate EDA
+- [State: Cases (Cumulative)](examples/va-respiratory/eval_va_respiratory_cases_cumulative_state.html)
+- [MSA: Cases (Cumulative)](examples/va-respiratory/eval_va_respiratory_cases_cumulative_msa.html)
+- [State: Cases (Rate)](examples/va-respiratory/eval_va_respiratory_cases_rate_state.html)
+- [MSA: Cases (Rate)](examples/va-respiratory/eval_va_respiratory_cases_rate_msa.html)
+- [State: Vaccines (Cumulative)](examples/va-respiratory/eval_va_respiratory_vaccines_cumulative_state.html)
+- [State: Vaccines (Per 100k)](examples/va-respiratory/eval_va_respiratory_vaccines_per_100k_state.html)
+
+## VA Respiratory: vs References
+- [State: COVID vs References](examples/va-respiratory/multi_comparison_va_respiratory_covid_state.html)
+- [State: Flu vs References](examples/va-respiratory/multi_comparison_va_respiratory_flu_state.html)
+- [State: RSV vs References](examples/va-respiratory/multi_comparison_va_respiratory_rsv_state.html)

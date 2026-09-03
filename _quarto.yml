@@ -5,6 +5,7 @@ project:
   post-render: scripts/post_render.R
   render:
     - index.qmd
+    - va.qmd
     - vignettes/eval_hhs_vs_doctor_visits_api_state.qmd
     - vignettes/eval_confirmed_incidence_num_vs_doctor_visits_api_county.qmd
   resources:
@@ -20,6 +21,16 @@ project:
     - "examples/sleepcycle/sleepcycle_all_county.html"
     - "examples/va/state_ci.html"
     - "examples/va/msa_ci.html"
+    - "examples/va-respiratory/eval_va_respiratory_cases_cumulative_state.html"
+    - "examples/va-respiratory/eval_va_respiratory_cases_cumulative_msa.html"
+    - "examples/va-respiratory/eval_va_respiratory_cases_rate_state.html"
+    - "examples/va-respiratory/eval_va_respiratory_cases_rate_msa.html"
+    - "examples/va-respiratory/eval_va_respiratory_vaccines_cumulative_state.html"
+    - "examples/va-respiratory/eval_va_respiratory_vaccines_per_100k_state.html"
+    - "examples/va-respiratory/multi_comparison_va_respiratory_covid_state.html"
+    - "examples/va-respiratory/multi_comparison_va_respiratory_flu_state.html"
+    - "examples/va-respiratory/multi_comparison_va_respiratory_rsv_state.html"
+    - "examples/va-respiratory/va_respiratory_pathogens_state.html"
     - "revision_analysis/revision_hospital_admissions_smoothed_covid19_from_claims_api_state.html"
     - "dataset_comparison/dataset_comparison_dv.html"
 
@@ -52,10 +63,8 @@ website:
             href: examples/sleepcycle/sleepcycle_all_state.html
           - text: "County: Sleep Cycle Cough Signals"
             href: examples/sleepcycle/sleepcycle_all_county.html
-          - text: "State: VA COVID Cases/100k"
-            href: examples/va/state_ci.html
-          - text: "MSA: VA COVID Cases/100k"
-            href: examples/va/msa_ci.html
+      - text: VA
+        href: va.html
       - text: Revisions
         menu:
           - text: "State: COVID-19 Hospital Admissions"
