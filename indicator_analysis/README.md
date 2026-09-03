@@ -205,6 +205,8 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | `max_archive_locs` | Max locations for version history | `60` | Optional |
 | `min_archive_days` | Min days of version history to enable revision analysis | `60` | Optional |
 | `ci_band_limit_mult` | Drop a confidence band wider than this × the value range from the location dropdown plot; raise (e.g. `Inf`) to always draw | `1` | Optional |
+| `comparable_across_locations` | Whether the level is comparable across locations, meaning a rate, percentage, or per-capita value rather than a raw count. When `FALSE`, the Location Variability section is dropped, because a count's spread across locations tracks population size, not agreement. `NULL` infers from the signal or name. | `NULL` (inferred) | Optional |
+| `value_type` | Kind of value the indicator carries: `cumulative`, `count`, `rate`, `percent`, `proportion`, or `other`. Only `cumulative` acts so far. It drops the Temporal Variability section, because a running total's change over time is a monotone ramp rather than dispersion. `NULL` infers from the signal or name. | `NULL` (inferred) | Optional |
 
 ### Parameters for `indicator_analysis/indicator_correlation.qmd`
 
