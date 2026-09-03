@@ -41,6 +41,11 @@ params:
   # from the location dropdown plot (2.2.2) as a near-empty-denominator outlier.
   # Raise it (e.g. Inf) to draw every reported band regardless of width.
   ci_band_limit_mult: 1
+  # Is the indicator's level comparable across locations (a rate, percentage or
+  # per-capita value)?
+  comparable_across_locations: !expr "NULL"
+  # What kind of value the indicator carries. One of: "cumulative", "count", "rate", "percent", "proportion", "other".
+  value_type: !expr "NULL"
 knitr:
   opts_chunk:
     comment: "#>"
@@ -80,7 +85,9 @@ if (!exists("params")) {
         max_locations_plot = 60,
         max_archive_locs = 60,
         min_archive_days = 60,
-        ci_band_limit_mult = 1
+        ci_band_limit_mult = 1,
+        comparable_across_locations = NULL,
+        value_type = NULL
     )
 }
 
@@ -513,6 +520,46 @@ smooth_quantiles <- !isFALSE(params$smooth_quantiles)
 show_geo_outliers <- !isFALSE(params$show_geo_outliers)
 show_versioning <- !isFALSE(params$show_versioning)
 
+# A raw count scales with a
+# location's size, so its cross-location spread is not what section 2.3 is meant
+# to show. Infer from the signal/name unless the caller sets the flag explicitly.
+count_like_name <- function(x) {
+    grepl("cumulative|(^|[ _])(num|count|counts|n)([ _]|$)|admission|encounter|(^|[ _])(ed|ip|op)$",
+          x, ignore.case = TRUE) &&
+        !grepl("100k|100000|per.?capita|pct|percent|rate|ratio|prop|/100|%",
+               x, ignore.case = TRUE)
+}
+comparable_across_locations <- if (is.null(params$comparable_across_locations)) {
+    !any(vapply(c(signals_vec, name_vec), count_like_name, logical(1)))
+} else isTRUE(params$comparable_across_locations)
+
+# The kind of value the indicator carries. A categorical `value_type` that the
+# report can branch on; for now only "cumulative" does anything (section 2.4).
+# Other categories are inferred and carried through for later use.
+infer_value_type <- function(x) {
+    x <- paste(x, collapse = " ")
+    if (grepl("cumulative", x, ignore.case = TRUE)) {
+        "cumulative"
+    } else if (grepl("100k|100000|per.?capita|(^|[ _])rate([ _]|$)|incidence", x, ignore.case = TRUE)) {
+        "rate"
+    } else if (grepl("pct|percent|%", x, ignore.case = TRUE)) {
+        "percent"
+    } else if (grepl("prop|ratio|frac", x, ignore.case = TRUE)) {
+        "proportion"
+    } else if (any(vapply(c(signals_vec, name_vec), count_like_name, logical(1)))) {
+        "count"
+    } else {
+        "other"
+    }
+}
+value_type_param <- flatten_param(params$value_type)
+value_type <- if (length(value_type_param) == 0 || !nzchar(trimws(value_type_param[1]))) {
+    infer_value_type(c(signals_vec, name_vec))
+} else {
+    tolower(trimws(value_type_param[1]))
+}
+cumulative_indicator <- identical(value_type, "cumulative")
+
 # Assign each observation to an epidemiological year starting in
 # `season_start_month` (7 = July-June, the usual influenza convention).
 season_start_month <- as.integer(params$season_start_month %||% 7L)
@@ -820,16 +867,36 @@ if (show_versioning && is.null(candidate_archive) && is.null(params$input_csv)) 
 ```
 
 ```{r}
+#| label: revision-analysis-setup
+#| echo: false
+
+archive <- NULL
+archive_has_history <- FALSE
+if (!is.null(candidate_archive) &&
+    n_distinct(candidate_archive$DT$version) > 1) {
+    archive <- candidate_archive
+    archive_span_days <- as.numeric(
+        max(archive$DT$version) - min(archive$DT$version),
+        units = "days"
+    )
+    archive_has_history <- archive_span_days >= params$min_archive_days
+}
+```
+
+```{r}
 #| label: quarto-metadata
 #| results: asis
 #| echo: false
-# Quarto metadata for the ::: {.content-visible} blocks below.
+# Quarto metadata for the ::: {.content-visible} blocks below. A section whose
+# flag is false is dropped
 cat(sprintf(
-    "\n---\nmulti_location: %s\nhas_strata: %s\ngeo_outliers: %s\nversioning: %s\n---\n",
+    "\n---\nmulti_location: %s\nhas_strata: %s\ngeo_outliers: %s\nversioning: %s\nlocation_comparable: %s\ncross_location_ok: %s\n---\n",
     tolower(n_locations > 1),
     tolower(length(params$extra_keys) > 0),
     tolower(show_geo_outliers && n_locations > 1),
-    tolower(show_versioning)
+    tolower(show_versioning && !is.null(archive)),
+    tolower(comparable_across_locations),
+    tolower(!cumulative_indicator)
 ))
 ```
 
@@ -1112,8 +1179,9 @@ if (!is.null(p)) p %>% plotly::partial_bundle()
 ```
 
 ::: {.content-visible when-meta="multi_location"}
+::: {.content-visible when-meta="location_comparable"}
 
-### Quantile Trends
+### Location Variability
 
 The distribution of the `r ind` across locations over time. The line is the median, the inner ribbon the 25th-75th percentile range (the middle 50% of locations), the outer ribbon the 5th-95th. Each panel has its own scale.
 
@@ -1126,7 +1194,7 @@ Each quantile covers only the locations that reported in that window, so panels 
 ```{r}
 #| label: eda-quantiles
 #| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 1.5), 15)
-#| eval: !expr n_locations > 1
+#| eval: !expr comparable_across_locations && n_locations > 1
 cat("\n")
 
 # One row per (key, period); geo_value is constant so epi_slide partitions by
@@ -1276,11 +1344,13 @@ if (nrow(aberrant_locs) > 0) {
 
 :::
 
+:::
 
 :::
 
 
 ::: {.content-visible when-meta="multi_location"}
+::: {.content-visible when-meta="cross_location_ok"}
 
 ### Temporal Variability
 
@@ -1295,7 +1365,7 @@ $$\text{CV}_i = \frac{\text{SD}(X_i)}{|\bar{X}_i|}$$
 ```{r}
 #| label: eda-noise
 #| fig-height: !expr min(max(5, length(signals_vec) * n_key_combos * 0.8), 12)
-#| eval: !expr n_locations > 1
+#| eval: !expr n_locations > 1 && isFALSE(cumulative_indicator)
 # One CV per (indicator, stratum, location), over reported values only
 noise_stats <- df_candidate %>%
     as_tibble() %>%
@@ -1363,38 +1433,16 @@ ggplot(noise_stats_plot, aes(x = cand_cv)) +
     theme(legend.position = "none")
 ```
 
-
-
-
-
 :::
 
-```{r}
-#| label: revision-analysis-setup
-#| echo: false
-# Get versioned data
-archive <- NULL
-archive_has_history <- FALSE
-if (!is.null(candidate_archive) &&
-    n_distinct(candidate_archive$DT$version) > 1) {
-    archive <- candidate_archive
-    archive_span_days <- as.numeric(
-        max(archive$DT$version) - min(archive$DT$version),
-        units = "days"
-    )
-    archive_has_history <- archive_span_days >= params$min_archive_days
-}
-```
-
-
-
+:::
 
 
 ::: {.content-visible when-meta="versioning"}
 
 ### Candidate Versioning
 
-Versioning is not the focus here. This section answers only whether the `r ind` `r sg_pl("revises", "revise")` at all and roughly how much. Relative revisions are scaled to the `r ind_poss` own magnitude: 0.1 means the observation shifted by 10% of its own size, and values near 1 mean revisions as large as the `r ind` `r sg_pl("itself", "themselves")`.
+Version dynamics is not the focus here. This section answers only whether the `r ind` `r sg_pl("revises", "revise")` at all and roughly how much. Relative revisions are scaled to the `r ind_poss` own magnitude: 0.1 means the observation shifted by 10% of its own size, and values near 1 mean revisions as large as the `r ind` `r sg_pl("itself", "themselves")`.
 
 ::: {.callout-tip}
 For revision lags by location, convergence over time, and how much of the latest value is knowable at each lag, use `revision_analysis/revision_analysis.qmd`.
@@ -1404,13 +1452,8 @@ For revision lags by location, convergence over time, and how much of the latest
 #| label: revision-analysis-text
 #| echo: false
 #| results: asis
-#| eval: !expr show_versioning
-if (is.null(archive)) {
-    cat(sprintf(
-        "No version history is available for `%s / %s` — versioning analysis is skipped.\n\n",
-        params$source, paste(signals_vec, collapse = ", ")
-    ))
-} else if (!archive_has_history) {
+#| eval: !expr show_versioning && !is.null(archive)
+if (!archive_has_history) {
     version_start <- min(archive$DT$version)
     cat(sprintf(
         "Versioning began on %s. At least 60 days of version history are needed for meaningful revision analysis; the earliest this will be possible is %s.\n\n",
@@ -1796,12 +1839,20 @@ if (!strata_comparable) {
 
 
 
-The table below flags locations whose seasonal peak is at least twice the typical (median) peak across all locations in the same season.
-
 ```{r}
 #| label: sanity-seasonality-anomalies
 #| echo: false
-#| eval: !expr as.numeric(difftime(max(df_candidate$time_value), min(df_candidate$time_value), units = "days")) >= 365
+#| results: asis
+has_full_year <- as.numeric(difftime(
+    max(df_candidate$time_value), min(df_candidate$time_value), units = "days"
+)) >= 365
+
+if (!has_full_year) {
+    cat("_Seasonal peak comparison needs at least one full year of history. Not enough data yet._\n")
+} else {
+
+cat("The table below flags locations whose seasonal peak is at least twice the typical (median) peak across all locations in the same season.\n\n")
+
 df_seasonal_loc <- df_candidate %>%
     as_tibble() %>%
     add_season() %>%
@@ -1828,24 +1879,28 @@ anomalies <- df_seasonal_loc %>%
     )
 
 if (nrow(anomalies) == 0) {
-    cat("No locations found with a seasonal max more than 2x the typical (median) seasonal max.")
+    cat("**(No locations flagged.)** No location's seasonal max exceeds 2x the typical (median) seasonal max.\n")
 } else {
-    DT::datatable(
-        anomalies,
-        colnames = c(
-            if (has_signal && multi_signal) "Indicator" else NULL,
-            str_to_title(str_replace_all(params$extra_keys, "_", " ")),
-            "Season", "Location", "Location Max", "Typical Max", "Ratio"
-        ),
-        caption = sprintf(
-            "Locations where seasonal max exceeds 2x the typical (median) seasonal max%s.",
-            if (multi_signal) "" else sprintf(" for %s", signal_labels[signals_vec])
-        ),
-        rownames = FALSE,
-        options = list(
-            scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
-            paging = TRUE, pageLength = 20, dom = "tp"
-        )
-    ) %>% DT::formatRound(columns = which(names(anomalies) %in% c("loc_max", "typical_max", "ratio")), digits = 3)
+    print(htmltools::tagList(
+        DT::datatable(
+            anomalies,
+            colnames = c(
+                if (has_signal && multi_signal) "Indicator" else NULL,
+                str_to_title(str_replace_all(params$extra_keys, "_", " ")),
+                "Season", "Location", "Location Max", "Typical Max", "Ratio"
+            ),
+            caption = sprintf(
+                "Locations where seasonal max exceeds 2x the typical (median) seasonal max%s.",
+                if (multi_signal) "" else sprintf(" for %s", signal_labels[signals_vec])
+            ),
+            rownames = FALSE,
+            options = list(
+                scrollX = TRUE, scrollY = "300px", scrollCollapse = TRUE,
+                paging = TRUE, pageLength = 20, dom = "tp"
+            )
+        ) %>% DT::formatRound(columns = which(names(anomalies) %in% c("loc_max", "typical_max", "ratio")), digits = 3)
+    ))
+}
+
 }
 ```
