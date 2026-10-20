@@ -16,11 +16,10 @@ params:
   signal: 
   signal_name: 
   # Optional path to a local CSV or Parquet directory with a version/issue column.
-  # When NULL, the signal is fetched from the Delphi API with issues = "*".
+  # When NULL, the signal's version history is fetched with epidata_archive().
   input_dir: !expr "NULL"
   # Shared settings
   geo_type:  
-  time_type: 
   start_day: 
   end_day:   
   # Maximum locations shown in faceted plots / summary tables.
@@ -54,14 +53,13 @@ execute:
 # When running interactively, fall back to the parameter defaults.
 if (!exists("params")) {
     params <- list(
-        source                = "hospital-admissions",
-        signal                = "smoothed_covid19_from_claims",
-        signal_name           = "Hospital Admissions: Smoothed COVID-19 from Claims",
-        input_dir             = "revision_analysis/data/revisions/",
+        source                = "nhsn",
+        signal                = "confirmed_admissions_covid_ew",
+        signal_name           = "NHSN: Confirmed COVID Admissions",
+        input_dir             = NULL,
         geo_type              = "state",
-        time_type             = "day",
-        start_day             = "2023-01-01",
-        end_day               = "2023-02-01",
+        start_day             = format(Sys.Date() - 365),
+        end_day               = format(Sys.Date()),
         max_locations_plot    = 6,
         max_locations_table   = 15,
         n_worst               = 18,
@@ -69,9 +67,21 @@ if (!exists("params")) {
     )
 }
 
+# Optional date bounds: a blank one is open-ended, and if both are blank the
+# V5 query gets no date filter at all.
+start_date <- as.Date(params$start_day %||% "1900-01-01")
+end_date <- as.Date(params$end_day %||% format(Sys.Date()))
+reference_window <- if (is.null(params$start_day) && is.null(params$end_day)) NULL else epidatr::epirange(start_date, end_date)
+
 # Load libraries
 if (!require("pak")) install.packages("pak")
-if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delphi/epiprocess@dev")
+# The V5 API needs epidatr >= 1.4.0 and epiprocess >= 0.13.0.
+min_versions <- c(epidatr = "1.4.0", epiprocess = "0.13.0")
+for (pkg in names(min_versions)) {
+    if (!requireNamespace(pkg, quietly = TRUE) || packageVersion(pkg) < min_versions[[pkg]]) {
+        pak::pkg_install(paste0("cmu-delphi/", pkg, "@dev"))
+    }
+}
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess, covidcast,
@@ -143,20 +153,6 @@ tibble::tribble(
         updater(name, params)
     })
 
-# Helper: build epirange with correct format for the signal's time_type
-time_range <- function(start, end, time_type = params$time_type) {
-    if (time_type == "week") {
-        to_yw <- function(d) {
-            d <- as.Date(d)
-            m <- MMWRweek::MMWRweek(d)
-            m$MMWRyear * 100L + m$MMWRweek
-        }
-        epirange(to_yw(start), to_yw(end))
-    } else {
-        epirange(start, end)
-    }
-}
-
 # Set cache
 cache_path <- file.path(getwd(), "epidatr_cache")
 if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
@@ -181,7 +177,7 @@ config_tbl <- tibble(
     Value = c(
         params$source, params$signal, params$signal_name,
         params$geo_type,
-        paste(params$start_day, "to", params$end_day)
+        paste(params$start_day %||% "first available", "to", params$end_day %||% "latest available")
     )
 )
 
@@ -210,10 +206,7 @@ if (!is.null(params$input_dir)) {
         cli::cli_inform("Reading data from directory: {.path {params$input_dir}}")
         raw <- arrow::open_dataset(path) %>%
             select(any_of(c("geo_value", "time_value", "version", "issue", "value"))) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            ) %>%
+            filter(time_value >= start_date, time_value <= end_date) %>%
             collect()
     } else if (grepl("\\.parquet$", path)) {
         cli::cli_inform("Reading Parquet file: {.path {params$input_dir}}")
@@ -241,10 +234,7 @@ if (!is.null(params$input_dir)) {
     if (!fs::is_dir(path)) {
         raw <- raw %>%
             mutate(version = as.Date(version)) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            )
+            filter(time_value >= start_date, time_value <= end_date)
     }
 
     archive <- raw %>%
@@ -253,59 +243,34 @@ if (!is.null(params$input_dir)) {
 
     msg_verb <- "Loaded"
 } else {
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
+    df_raw <- epidata_archive(
+        source = params$source,
+        signals = params$signal,
+        geo_type = params$geo_type,
+        reference_time = reference_window
+    )
 
-    if (params$source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$source)
-                params$signal %in% meta_res[[params$source]]$signals
-            },
-            error = function(e) {
-                FALSE
-            }
-        )
-        if (meta_available) {
-            use_new_api <- TRUE
-        }
-    }
-
-    if (use_new_api) {
-        df_raw <- epidata_archive(
-            source = params$source,
-            signals = params$signal,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time"))) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            )
-    } else {
-        df_raw <- pub_covidcast(
-            source = params$source,
-            signal = params$signal,
-            geo_type = params$geo_type,
-            time_type = params$time_type,
-            time_values = epirange(params$start_day, params$end_day),
-            issues = "*"
-        )
-    }
-
-    if ("issue" %in% colnames(df_raw) && !"version" %in% colnames(df_raw)) {
-        df_raw <- rename(df_raw, version = issue)
-    }
-
-    if (nrow(df_raw) == 0 || !"version" %in% colnames(df_raw)) {
+    if (nrow(df_raw) == 0) {
         cli::cli_abort(
             "No versioned data returned from the API. ",
             "The signal may not support revision history."
         )
     }
+    # This notebook has no extra keys, so each time series (geo_value) must use
+    # a single fill method.
+    mixed_geos <- df_raw %>%
+        summarize(n = n_distinct(fill_method), .by = geo_value) %>%
+        filter(n > 1) %>%
+        pull(geo_value)
+    if (length(mixed_geos) > 0) {
+        cli::cli_abort(c(
+            "{params$source}/{params$signal} mixes fill methods within a time series ({.val {mixed_geos}}), and this notebook can only analyze one fill method per time series (geo_value).",
+            "i" = "Filter the data to one fill method and pass it as a CSV or Parquet file through {.arg input_dir}."
+        ))
+    }
 
     archive <- df_raw %>%
-        select(geo_value, time_value, version, value) %>%
+        select(geo_value, reference_time, report_time, value) %>%
         as_epi_archive()
 
     msg_verb <- "Fetched"
@@ -809,7 +774,7 @@ date_range_days <- as.numeric(max(stability_combined$time_value) - min(stability
 agg_unit <- case_when(
     date_range_days > 365 * 2 ~ "quarter",
     date_range_days > 365 ~ "month",
-    date_range_days > 100 ~ "2-week",
+    date_range_days > 100 ~ "14 days",
     date_range_days > 40 ~ "week",
     date_range_days > 20 ~ "3-day",
     TRUE ~ "day"
@@ -1200,7 +1165,7 @@ pct_under <- label_percent()(mean(bias_by_loc$median_bias < 0))
 cat(sprintf(
     "For **%s** (`%s / %s`), the version history covering %s to %s\nshows the following revision and backfill profile:\n\n",
     params$signal_name, params$source, params$signal,
-    params$start_day, params$end_day
+    format(min(archive$DT$time_value)), format(max(archive$DT$time_value))
 ))
 
 cat(sprintf("- **%s** of observations were never revised after their initial report.\n", p_no_rev))

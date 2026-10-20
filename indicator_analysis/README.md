@@ -18,7 +18,7 @@ To run this notebook, you need to install Quarto. You can install Quarto via:
 
 ## Running the analysis
 
-Running an analysis requires different parameters depending on the data source. For local CSV files, only the file path is required because the geographic level and time resolution are automatically inferred. For API queries, you must specify the source, signal, and geographic level. If you are querying a legacy dataset that does not support the V5 API, you must also provide the time resolution.
+Running an analysis requires different parameters depending on the data source. For local CSV files, only the file path is required because the geographic level and time resolution are automatically inferred. For API queries, you must specify the source, signal, and geographic level. Only Epidata V5 sources are supported. `epidatr::epidata_meta()` lists them with their signals and geo types.
 
 ### 1. Candidate Indicator Evaluation (`indicator_evaluation.qmd`)
 
@@ -48,13 +48,12 @@ Full example with all options, using the CLI:
 
 ```bash
 quarto render indicator_analysis/indicator_evaluation.qmd \
-  -P source:doctor-visits \
-  -P signal:smoothed_adj_cli \
-  -P name:"Doctor Visits: Smoothed Adj CLI" \
+  -P source:nssp \
+  -P signal:pct_ed_visits_covid \
+  -P name:"NSSP: % ED Visits COVID" \
   -P geo_type:state \
-  -P time_type:day \
-  -P start_day:2020-09-01 \
-  -P end_day:2023-03-01
+  -P start_day:2023-01-01 \
+  -P end_day:2025-12-31
 ```
 
 Or from R:
@@ -63,13 +62,12 @@ Or from R:
 quarto::quarto_render(
   "indicator_analysis/indicator_evaluation.qmd",
   execute_params = list(
-    source = "doctor-visits",
-    signal = "smoothed_adj_cli", # can also be a vector, e.g. c("pct_ed_visits_covid", "pct_ed_visits_influenza")
-    name = "Doctor Visits: Smoothed Adj CLI", # can also be a vector, e.g. c("COVID-19 % ED", "Flu % ED")
+    source = "nssp",
+    signal = "pct_ed_visits_covid", # can also be a vector, e.g. c("pct_ed_visits_covid", "pct_ed_visits_influenza")
+    name = "NSSP: % ED Visits COVID", # can also be a vector, e.g. c("COVID-19 % ED", "Flu % ED")
     geo_type = "state",
-    time_type = "day",
-    start_day = "2020-09-01",
-    end_day = "2023-03-01"
+    start_day = "2023-01-01",
+    end_day = "2025-12-31"
   )
 )
 ```
@@ -106,16 +104,15 @@ Full example with all options, using the CLI:
 
 ```bash
 quarto render indicator_analysis/indicator_correlation.qmd \
-  -P guiding_source:hhs \
-  -P guiding_indicator:confirmed_admissions_covid_1d \
-  -P guiding_name:"COVID Hospital Admissions (HHS)" \
-  -P candidate_source:google-symptoms \
-  -P candidate_indicator:s02_raw_search \
-  -P candidate_name:"Google Symptoms: Cough" \
+  -P guiding_source:nhsn \
+  -P guiding_indicator:confirmed_admissions_covid_ew \
+  -P guiding_name:"COVID Hospital Admissions (NHSN)" \
+  -P candidate_source:nssp \
+  -P candidate_indicator:pct_ed_visits_covid \
+  -P candidate_name:"NSSP: % ED Visits COVID" \
   -P geo_type:state \
-  -P time_type:day \
-  -P start_day:2020-09-01 \
-  -P end_day:2023-03-01
+  -P start_day:2023-01-01 \
+  -P end_day:2025-12-31
 ```
 
 Or from R:
@@ -124,16 +121,15 @@ Or from R:
 quarto::quarto_render(
   "indicator_analysis/indicator_correlation.qmd",
   execute_params = list(
-    guiding_source = "hhs",
-    guiding_indicator = "confirmed_admissions_covid_1d",
-    guiding_name = "COVID Hospital Admissions (HHS)",
-    candidate_source = "google-symptoms",
-    candidate_indicator = "s02_raw_search",
-    candidate_name = "Google Symptoms: Cough",
+    guiding_source = "nhsn",
+    guiding_indicator = "confirmed_admissions_covid_ew",
+    guiding_name = "COVID Hospital Admissions (NHSN)",
+    candidate_source = "nssp",
+    candidate_indicator = "pct_ed_visits_covid",
+    candidate_name = "NSSP: % ED Visits COVID",
     geo_type = "state",
-    time_type = "day",
-    start_day = "2020-09-01",
-    end_day = "2023-03-01"
+    start_day = "2023-01-01",
+    end_day = "2025-12-31"
   )
 )
 ```
@@ -148,26 +144,21 @@ From R:
 quarto::quarto_render(
   "indicator_analysis/indicator_multi_comparison.qmd",
   execute_params = list(
-    candidate_source = "doctor-visits",
-    candidate_indicator = "smoothed_adj_cli",
-    candidate_name = "Doctor Visits: Smoothed Adj CLI",
-    reference_sources = c("quidel", "hospital-admissions", "chng", "chng"),
+    candidate_source = "nssp",
+    candidate_indicator = "pct_ed_visits_covid",
+    candidate_name = "NSSP: % ED Visits COVID",
+    reference_sources = c("nhsn", "claims_outpatient"),
     reference_indicators = c(
-      "covid_ag_smoothed_pct_positive",
-      "smoothed_covid19_from_claims",
-      "7dav_inpatient_covid",
-      "7dav_outpatient_covid"
+      "confirmed_admissions_covid_ew",
+      "claims_outpatient_ov_pct_claims_covid"
     ),
     reference_names = c(
-      "Quidel: Smoothed % Positive COVID Antigen",
-      "Hospital Admissions: Smoothed COVID-19 from Claims",
-      "CHNG: 7-day Avg Inpatient COVID",
-      "CHNG: 7-day Avg Outpatient COVID"
+      "NHSN: Confirmed COVID Admissions",
+      "Claims: % Outpatient Visits COVID"
     ),
     geo_type = "state",
-    time_type = "day",
-    start_day = "2020-09-01",
-    end_day = "2023-03-01"
+    start_day = "2023-01-01",
+    end_day = "2025-12-31"
   )
 )
 ```
@@ -193,9 +184,8 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | `name` | Display label for candidate indicator | Signal name | Optional |
 | `input_csv` | Path to local candidate CSV | `NULL` | Required for CSV |
 | `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | — | Required for API; inferred from CSV metadata |
-| `time_type` | Time resolution (`day`, `week`, `month`) | Inferred from metadata, else `"day"` | Required for legacy API; automatically inferred for CSV/V5 |
-| `start_day` | Start date (YYYY-MM-DD) | 2 years before `end_day` | Optional |
-| `end_day` | End date (YYYY-MM-DD) | Today | Optional |
+| `start_day` | Start date (YYYY-MM-DD) | First available date | Optional |
+| `end_day` | End date (YYYY-MM-DD) | Latest available date | Optional |
 | `extra_keys` | Extra key columns beyond `geo_value`/`time_value` for stratification | - | Optional |
 | `season_start_month` | First month of the epidemiological year for the seasonality panels (7 = Jul–Jun, the flu convention) | `7` | Optional |
 | `smooth_quantiles` | Smooth the quantile trends with a moving average | `TRUE` | Optional |
@@ -221,9 +211,8 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | `candidate_csv` | Path to local candidate CSV | `NULL` | Required for CSV |
 | `candidate_name` | Display label for candidate indicator | `candidate_indicator` value | Optional |
 | `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | `"state"` | Required for API; automatically inferred for CSV |
-| `time_type` | Time resolution (`day`, `week`, `month`) | `NULL` (inferred from metadata) | Required for legacy API; automatically inferred for CSV/V5 |
-| `start_day` | Start date (YYYY-MM-DD) | 2 years before `end_day` | Optional |
-| `end_day` | End date (YYYY-MM-DD) | Today | Optional |
+| `start_day` | Start date (YYYY-MM-DD) | First available date | Optional |
+| `end_day` | End date (YYYY-MM-DD) | Latest available date | Optional |
 | `max_locations_plot` | Max locations in faceted plots | `60` | Optional |
 | `max_archive_locs` | Max locations for version history | `60` | Optional |
 | `min_archive_days` | Min days of history for revision analysis | `60` | Optional |
@@ -240,14 +229,10 @@ Rscript indicator_analysis/indicator_evaluation_examples.R
 | `reference_indicators` | Vector of reference indicator names | `character()` | Required for API references |
 | `reference_names` | Display labels for reference indicators | `character()` | Required |
 | `reference_csvs` | Vector of local reference CSV paths | `NULL` | Required for CSV references |
-| `extra_keys` | Extra key columns beyond `geo_value`/`time_value` for stratification | `character()` | Optional |
 | `geo_type` | Geographic level (e.g., `state`, `county`, `msa`) | — | Required |
-| `time_type` | Time resolution (`day`, `week`, `month`) | — | Required |
-| `start_day` | Start date (YYYY-MM-DD) | — | Required |
-| `end_day` | End date (YYYY-MM-DD) | — | Required |
+| `start_day` | Start date (YYYY-MM-DD) | First available date | Optional |
+| `end_day` | End date (YYYY-MM-DD) | Latest available date | Optional |
 | `max_locations_plot` | Max locations in plots/tables | `12` | Optional |
-| `api_timeout_seconds` | Epidata request timeout in seconds | `60` | Optional |
-| `api_chunk_days` | Days per chunk for legacy API requests | `30` | Optional |
 
 ---
 
@@ -273,7 +258,8 @@ CSV files must include the following columns:
 | `signal` | (Optional, for multiple signals) The signal identifier | `pct_ed_visits_covid` |
 | `version` | (Optional) Issue/version date for revision analysis (can also be named `issue`) | `2023-01-05` |
 | `ci_lower`, `ci_upper` | (Optional) Confidence bounds, carried along for the overview plot's bands | `10.1`, `14.7` |
-| *(`extra_keys` columns)* | (Optional) Additional stratification columns named via the `extra_keys` param | `age_group` |
+| *(`extra_keys` columns)* | (Optional) Additional stratification columns named via the `extra_keys` param (evaluation notebook only) | `age_group` |
+| `fill_method` | (Optional) How each value was produced, as in V5 data. The correlation and multi-comparison notebooks need one fill method per location | `source` |
 
 > [!NOTE]
 > Including a `version` (or `issue`) column automatically enables the **Candidate Versioning** analysis.

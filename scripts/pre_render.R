@@ -23,7 +23,6 @@ if (!file.exists(out_comp_state)) {
       candidate_indicator = "smoothed_adj_cli",
       candidate_name = "Doctor Visits: Smoothed Adj CLI",
       geo_type = "state",
-      time_type = "day",
       start_day = "2020-09-01",
       end_day = "2023-03-01"
     )
@@ -57,7 +56,6 @@ if (!file.exists(out_multi_comp_state)) {
         "CHNG: 7-day Avg Outpatient COVID"
       ),
       geo_type = "state",
-      time_type = "day",
       start_day = "2020-09-01",
       end_day = "2023-03-01"
     )
@@ -78,7 +76,6 @@ if (!file.exists(out_eval_state)) {
       signal = "smoothed_adj_cli",
       name = "Doctor Visits: Smoothed Adj CLI",
       geo_type = "state",
-      time_type = "day",
       start_day = "2020-09-01",
       end_day = "2023-03-01"
     )
@@ -102,7 +99,6 @@ if (!file.exists(out_county_comp)) {
       candidate_indicator = "smoothed_adj_cli",
       candidate_name = "Doctor Visits: Smoothed Adj CLI",
       geo_type = "county",
-      time_type = "day",
       start_day = "2023-01-01",
       end_day = "2023-02-01"
     )
@@ -123,7 +119,6 @@ if (!file.exists(out_county_eval)) {
       signal = "smoothed_adj_cli",
       name = "Doctor Visits: Smoothed Adj CLI",
       geo_type = "county",
-      time_type = "day",
       start_day = "2023-01-01",
       end_day = "2023-02-01"
     )
@@ -145,7 +140,6 @@ if (!file.exists(out_rev_state)) {
       signal_name = "Hospital Admissions: Smoothed COVID-19 from Claims",
       input_dir = "revision_analysis/data/revisions",
       geo_type = "state",
-      time_type = "day",
       start_day = "2020-01-01",
       end_day = "2023-12-31"
     )

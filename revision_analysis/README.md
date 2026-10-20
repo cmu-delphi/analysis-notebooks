@@ -9,26 +9,24 @@ Because this notebook is a generalized template, **it has no default indicator**
 
 ```bash
 quarto render revision_analysis.qmd \
-  -P source:hospital-admissions \
-  -P signal:smoothed_covid19_from_claims \
-  -P signal_name:"Hospital Admissions: Smoothed COVID-19" \
+  -P source:nhsn \
+  -P signal:confirmed_admissions_covid_ew \
+  -P signal_name:"NHSN: Confirmed COVID Admissions" \
   -P geo_type:state \
-  -P time_type:day \
   -P start_day:2020-01-01 \
-  -P end_day:2023-12-31
+  -P end_day:2025-12-31
 ```
 
 ```r
 quarto::quarto_render(
   "revision_analysis.qmd",
   execute_params = list(
-    source      = "hospital-admissions",
-    signal      = "smoothed_covid19_from_claims",
-    signal_name = "Hospital Admissions: Smoothed COVID-19",
+    source      = "nhsn",
+    signal      = "confirmed_admissions_covid_ew",
+    signal_name = "NHSN: Confirmed COVID Admissions",
     geo_type    = "state",
-    time_type   = "day",
     start_day   = "2020-01-01",
-    end_day     = "2023-12-31"
+    end_day     = "2025-12-31"
   )
 )
 ```
@@ -37,14 +35,13 @@ quarto::quarto_render(
 
 | Parameter               | Description                                                       | Default                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- |
-| `source`                | COVIDcast data source                                             | *None (Required)*                                    |
+| `source`                | Epidata V5 source (see `epidata_meta()`)                          | *None (Required)*                                    |
 | `signal`                | Signal name                                                       | *None (Required)*                                    |
 | `signal_name`           | Human-readable label                                              | *None (Required)*                                    |
-| `input_dir`             | Path to local data (CSV, Parquet, or Directory). `NULL` = use API | `NULL`                                               |
+| `input_dir`             | Path to local data (CSV, Parquet, or Directory). `NULL` = use the V5 API | `NULL`                                               |
 | `geo_type`              | Geographic level (`state`, `county`, `hhs`, …)                    | *None (Required)*                                    |
-| `time_type`             | Time resolution (`day`, `week`)                                   | *None (Required)*                                    |
-| `start_day`             | Start of the time_value range (YYYY-MM-DD)                        | *None (Required)*                                    |
-| `end_day`               | End of the time_value range (YYYY-MM-DD)                          | *None (Required)*                                    |
+| `start_day`             | Start of the time_value range (YYYY-MM-DD)                        | First available date                                 |
+| `end_day`               | End of the time_value range (YYYY-MM-DD)                          | Latest available date                                |
 | `max_locations_plot`    | Max locations in faceted plots                                    | `6`                                                  |
 | `max_locations_table`   | Rows per page in summary tables                                   | `15`                                                 |
 | `n_worst`               | Number of worst-behaving locations to highlight in fan plots      | `18`                                                 |

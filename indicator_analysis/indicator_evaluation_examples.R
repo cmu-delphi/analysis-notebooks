@@ -29,54 +29,17 @@ get_eval_output_name <- function(params, suffix = "") {
   stringr::str_replace_all(name, "[[:space:]-]", "_")
 }
 
-# COVID Doctor Visits (State level)
-# Candidate-only EDA
-eval_params_1 <- list(
-  source = "doctor-visits",
-  signal = "smoothed_adj_cli",
-  name = "Doctor Visits: Smoothed Adj CLI",
-  geo_type = "state",
-  time_type = "day",
-  start_day = "2020-09-01",
-  end_day = "2023-03-01"
-)
-
-quarto::quarto_render(
-  input = eval_qmd_path,
-  output_file = get_eval_output_name(eval_params_1, "_api_state"),
-  execute_params = eval_params_1
-)
-
-# Comparison
-comp_params_1 <- list(
-  guiding_source = "hhs",
-  guiding_indicator = "confirmed_admissions_covid_1d",
-  guiding_name = "COVID Hospital Admissions (HHS)",
-  candidate_source = "doctor-visits",
-  candidate_indicator = "smoothed_adj_cli",
-  candidate_name = "Doctor Visits: Smoothed Adj CLI",
-  geo_type = "state",
-  time_type = "day",
-  start_day = "2020-09-01",
-  end_day = "2023-03-01"
-)
-quarto::quarto_render(
-  input = comp_qmd_path,
-  output_file = get_comp_output_name(comp_params_1, "_api_state"),
-  execute_params = comp_params_1
-)
-
 # PopHive COVID (State level)
 
 # Candidate-only EDA
 eval_params_2 <- list(
-  source = "beta_pophive",
-  signal = "epic_pct_covid_total",
-  name = "PopHive: Epic % COVID Total",
+  source = "pophive",
+  signal = "covid_pct_ed",
+  name = "PopHive: % ED Visits COVID",
   geo_type = "state",
-  time_type = "week",
   start_day = "2020-01-01",
-  end_day = "2026-03-27"
+  end_day = format(Sys.Date()),
+  extra_keys = "age_group"
 )
 quarto::quarto_render(
   input = eval_qmd_path,
@@ -84,18 +47,18 @@ quarto::quarto_render(
   execute_params = eval_params_2
 )
 
-# Comparison
+# Comparison. PopHive is split by age group, which the correlation notebook
+# cannot handle, so NSSP stands in as the ED-visit candidate.
 comp_params_2 <- list(
   guiding_source = "nhsn",
   guiding_indicator = "confirmed_admissions_covid_ew",
   guiding_name = "COVID Hospital Admissions (NHSN)",
-  candidate_source = "beta_pophive",
-  candidate_indicator = "epic_pct_covid_total",
-  candidate_name = "PopHive: Epic % COVID Total",
+  candidate_source = "nssp",
+  candidate_indicator = "pct_ed_visits_covid",
+  candidate_name = "NSSP: % ED Visits COVID",
   geo_type = "state",
-  time_type = "week",
   start_day = "2020-01-01",
-  end_day = "2026-03-27"
+  end_day = format(Sys.Date())
 )
 quarto::quarto_render(
   input = comp_qmd_path,
@@ -108,13 +71,13 @@ quarto::quarto_render(
 
 # Candidate-only EDA
 eval_params_3 <- list(
-  source = "beta_pophive",
-  signal = "epic_pct_flu_total",
-  name = "PopHive: Epic % flu Total",
+  source = "pophive",
+  signal = "flu_pct_ed",
+  name = "PopHive: % ED Visits Flu",
   geo_type = "state",
-  time_type = "week",
   start_day = "2020-01-01",
-  end_day = "2026-03-27"
+  end_day = format(Sys.Date()),
+  extra_keys = "age_group"
 )
 quarto::quarto_render(
   input = eval_qmd_path,
@@ -122,18 +85,17 @@ quarto::quarto_render(
   execute_params = eval_params_3
 )
 
-# Comparison
+# Comparison (NSSP for the same reason as above)
 comp_params_3 <- list(
   guiding_source = "nhsn",
   guiding_indicator = "confirmed_admissions_flu_ew",
   guiding_name = "flu Hospital Admissions (NHSN)",
-  candidate_source = "beta_pophive",
-  candidate_indicator = "epic_pct_flu_total",
-  candidate_name = "PopHive: Epic % flu Total",
+  candidate_source = "nssp",
+  candidate_indicator = "pct_ed_visits_influenza",
+  candidate_name = "NSSP: % ED Visits Flu",
   geo_type = "state",
-  time_type = "week",
   start_day = "2020-01-01",
-  end_day = "2026-03-27"
+  end_day = format(Sys.Date())
 )
 quarto::quarto_render(
   input = comp_qmd_path,
@@ -202,7 +164,6 @@ eval_params_4 <- list(
   input_csv = as.character(candidate_csv_path),
   start_day = start_day_val,
   end_day = end_day_val,
-  time_type = "week",
   geo_type = "state"
 )
 quarto::quarto_render(
@@ -223,7 +184,6 @@ comp_params_4 <- list(
   candidate_csv = as.character(candidate_csv_path),
   start_day = start_day_val,
   end_day = end_day_val,
-  time_type = "week",
   geo_type = "state"
 )
 quarto::quarto_render(
@@ -233,25 +193,7 @@ quarto::quarto_render(
 )
 
 
-# County Level (Commented Out)
-# Default API (County level) - Commented out to skip low-level geo locations during automated runs
-# eval_params_5 <- list(
-#   source = "doctor-visits",
-#   signal = "smoothed_adj_cli",
-#   name = "Doctor Visits: Smoothed Adj CLI",
-#   geo_type = "county",
-#   time_type = "day",
-#   start_day = "2023-01-01",
-#   end_day = "2023-02-01"
-# )
-# quarto::quarto_render(
-#   input = eval_qmd_path,
-#   output_file = get_eval_output_name(eval_params_5, "_api_county"),
-#   execute_params = eval_params_5
-# )
-
-
-# NSSP vs PopHive (State level)
+# NSSP vs NHSN (State level)
 
 # Candidate-only EDA
 eval_params_6 <- list(
@@ -259,7 +201,6 @@ eval_params_6 <- list(
   signal = "smoothed_pct_ed_visits_covid",
   name = "NSSP: Smoothed % ED Visits COVID",
   geo_type = "state",
-  time_type = "week",
   start_day = "2023-01-01",
   end_day = "2024-01-01"
 )
@@ -271,14 +212,13 @@ quarto::quarto_render(
 
 # Comparison
 comp_params_6 <- list(
-  guiding_source = "beta_pophive",
-  guiding_indicator = "epic_pct_covid_total",
-  guiding_name = "PopHive: Epic % COVID Total",
+  guiding_source = "nhsn",
+  guiding_indicator = "confirmed_admissions_covid_ew",
+  guiding_name = "COVID Hospital Admissions (NHSN)",
   candidate_source = "nssp",
   candidate_indicator = "smoothed_pct_ed_visits_covid",
   candidate_name = "NSSP: Smoothed % ED Visits COVID",
   geo_type = "state",
-  time_type = "week",
   start_day = "2023-01-01",
   end_day = "2024-01-01"
 )
@@ -295,7 +235,6 @@ eval_params_nwss_multi <- list(
     signal = c("pct_ed_visits_covid", "pct_ed_visits_influenza"),
     name = c("COVID-19 % ED", "Flu % ED"),
     geo_type= "state",
-    time_type = "week",
     start_day = "2022-01-01",
     end_day = "2025-12-31",
     max_locations_plot = 60,

@@ -17,7 +17,6 @@ params:
   input_csv: !expr "NULL"
   # Shared settings
   geo_type:
-  time_type:
   start_day:
   end_day:
   # Extra key columns beyond geo_value/time_value (character vector), e.g. "age_group"
@@ -69,15 +68,14 @@ execute:
 # When running interactively, populate params from defaults
 if (!exists("params")) {
     params <- list(
-        source = "beta_pophive",
-        signal = "epic_pct_covid_total",
-        name = "PopHive: Epic % COVID Total",
+        source = "pophive",
+        signal = "covid_pct_ed",
+        name = "PopHive: % ED Visits COVID",
         input_csv = NULL,
         geo_type = "state",
-        time_type = NULL,
         end_day = format(Sys.Date()),
         start_day = format(Sys.Date() - 365 * 2),
-        extra_keys = character(0),
+        extra_keys = "age_group",
         season_start_month = 7,
         smooth_quantiles = TRUE,
         show_geo_outliers = TRUE,
@@ -114,7 +112,6 @@ params$source <- flatten_param(params$source)
 params$signal <- flatten_param(params$signal)
 params$name <- flatten_param(params$name)
 params$geo_type <- flatten_param(params$geo_type)
-params$time_type <- flatten_param(params$time_type)
 params$input_csv <- flatten_param(params$input_csv)
 
 # The CSV path is relative to whichever directory quarto renders from, so try it
@@ -138,12 +135,21 @@ if (!is.null(params$input_csv) &&
     params$source <- tools::file_path_sans_ext(basename(params$input_csv))
 }
 
-if (is.null(params$end_day)   || !nzchar(params$end_day))   params$end_day   <- format(Sys.Date())
-if (is.null(params$start_day) || !nzchar(params$start_day)) params$start_day <- format(as.Date(params$end_day) - 365 * 2)
+# Optional date bounds: a blank one is open-ended, and if both are blank the
+# V5 query gets no date filter at all.
+start_date <- as.Date(params$start_day %||% "1900-01-01")
+end_date <- as.Date(params$end_day %||% format(Sys.Date()))
+reference_window <- if (is.null(params$start_day) && is.null(params$end_day)) NULL else epidatr::epirange(start_date, end_date)
 
 # Load libraries
 if (!require("pak")) install.packages("pak")
-if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delphi/epiprocess@dev")
+# The V5 API needs epidatr >= 1.4.0 and epiprocess >= 0.13.0.
+min_versions <- c(epidatr = "1.4.0", epiprocess = "0.13.0")
+for (pkg in names(min_versions)) {
+    if (!requireNamespace(pkg, quietly = TRUE) || packageVersion(pkg) < min_versions[[pkg]]) {
+        pak::pkg_install(paste0("cmu-delphi/", pkg, "@dev"))
+    }
+}
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess,
@@ -283,20 +289,6 @@ tibble::tribble(
         updater <- if (is_stat) update_stat_defaults else update_geom_defaults
         updater(name, setNames(list(dis_pal_list[1], alpha), c(aes, "alpha")))
     })
-
-# An epirange in whatever format the indicator's time_type needs
-time_range <- function(start, end, time_type = params$time_type) {
-    if (time_type == "week") {
-        to_yw <- function(d) {
-            d <- as.Date(d)
-            m <- MMWRweek::MMWRweek(d)
-            m$MMWRyear * 100L + m$MMWRweek
-        }
-        epirange(to_yw(start), to_yw(end))
-    } else {
-        epirange(start, end)
-    }
-}
 
 # Map geo codes to readable names, for display only: the codes stay in the data
 # because the API queries and the HHS crosswalk join on them. Unmapped codes and
@@ -604,7 +596,7 @@ if (!is.null(params$input_csv)) {
     # from county FIPS codes in states 01-09 (AL, AK, AZ, AR, CA, CO, CT).
     df_candidate_raw <- read.csv(params$input_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
-        filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day))
+        filter(time_value >= start_date, time_value <= end_date)
 
     # A file may hold more indicators than were asked for. Keep only the
     # requested ones, or every one of them would be analysed and labelled NA.
@@ -648,65 +640,40 @@ if (!is.null(params$input_csv)) {
         load_note <- "a local CSV"
     }
 } else {
-    # Determine if new API can be used for candidate source
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
-    if (params$source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$source)
-                all(signals_vec %in% meta_res[[params$source]]$signals)
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
+    # epiprocess reads reference_time as time_value and report_time as version.
+    df_candidate <- epidata_snapshot(params$source, signals_vec, params$geo_type, reference_time = reference_window)
+    # A time series (geo_value, signal and extra keys) that mixes fill methods
+    # gets fill_method as a stratum, like any other extra key.
+    n_fill_methods <- df_candidate %>%
+        summarize(n = n_distinct(fill_method), .by = c(geo_value, any_of(c("signal", params$extra_keys))))
+    if (any(n_fill_methods$n > 1)) {
+        params$extra_keys <- union(params$extra_keys, "fill_method")
     }
-    if (use_new_api) {
-        # epidata_snapshot does not accept multiple signals
-        df_candidate <- purrr::map(signals_vec, ~ {
-            epidata_snapshot(
-                source = params$source,
-                signals = .x,
-                geo_type = params$geo_type
-            ) %>%
-                rename(any_of(c(time_value = "reference_time", version = "report_time"))) %>%
-                {
-                    if ("fill_method" %in% colnames(.)) {
-                        filter(., fill_method == "source" | !any(fill_method == "source"))
-                    } else .
-                } %>%
-                filter(
-                    time_value >= as.Date(params$start_day),
-                    time_value <= as.Date(params$end_day)
-                ) %>%
-                select(geo_value, any_of("signal"), time_value, any_of(params$extra_keys),
-                       value, any_of(c("ci_lower", "ci_upper")))
-        }) %>%
-            bind_rows() %>%
-            as_epi_df(other_keys = params$extra_keys,
-                      signal_format = if ("signal" %in% names(.)) "add_key" else "as_is")
-    } else {
-        # pub_covidcast accepts a signal vector and always returns a signal column
-        df_candidate <- pub_covidcast(
-            params$source, signals_vec,
-            params$geo_type, params$time_type,
-            time_values = time_range(params$start_day, params$end_day),
-            as_of = Sys.Date()
-        ) %>% as_epi_df(other_keys = params$extra_keys, signal_format = "add_key")
+    # Columns that split a location's series (age_group, say) must be extra keys.
+    if (anyDuplicated(select(df_candidate, geo_value, reference_time, any_of(c("signal", params$extra_keys)))) > 0) {
+        split_cols <- setdiff(names(df_candidate), c("signal", "report_time", "geo_type", "geo_value", "fill_method",
+                                                     "reference_time", "value", "ci_lower", "ci_upper", params$extra_keys))
+        cli::cli_abort(c(
+            "{params$source} has several rows per location and date.",
+            "i" = "Add the columns that split them to {.arg extra_keys}{if (length(split_cols) > 0) ', e.g. ' else ''}{.val {split_cols}}."
+        ))
     }
+    df_candidate <- df_candidate %>%
+        select(geo_value, any_of("signal"), reference_time, any_of(params$extra_keys),
+               value, any_of(c("ci_lower", "ci_upper"))) %>%
+        as_epi_df(other_keys = params$extra_keys,
+                  signal_format = if ("signal" %in% names(.)) "add_key" else "as_is")
     load_note <- sprintf("the %s API", params$source)
 }
 
+# Blank start_day/end_day take the loaded data's range.
+params$start_day <- params$start_day %||% format(min(df_candidate$time_value))
+params$end_day <- params$end_day %||% format(max(df_candidate$time_value))
+
 # Resolved before the archive fetch so the table below can report periods
 # and strata.
+# epiprocess infers the time type
 env_time_type <- attributes(df_candidate)$metadata$time_type
-if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
-    env_time_type <- params$time_type
-}
-if (is.null(env_time_type) || !nzchar(env_time_type)) {
-    env_time_type <- "day"
-}
-params$time_type <- env_time_type
 
 env_geo_type <- attributes(df_candidate)$metadata$geo_type
 if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
@@ -788,20 +755,6 @@ DT::datatable(
 # Revision history from the API, unless the CSV already supplied it. Skipped
 # when the versioning section is off: issues = "*" is the slowest query here.
 if (show_versioning && is.null(candidate_archive) && is.null(params$input_csv)) {
-    # Only fetch version history if the source supports revisions
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
-    if (params$source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$source)
-                all(signals_vec %in% meta_res[[params$source]]$signals)
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
-    }
-
     # Fetch archive for revision behavior
     archive_geos <- unique(df_candidate$geo_value)
     # Limit number of locations for version history queries to avoid API limits
@@ -819,49 +772,25 @@ if (show_versioning && is.null(candidate_archive) && is.null(params$input_csv)) 
         time_value_end = params$end_day
     )
 
-    if (use_new_api) {
-        # epidata_archive does not accept multiple signals
-        df_archive_raw <- purrr::map(signals_vec, ~ {
-            epidata_archive(
-                source = params$source,
-                signals = .x,
-                geo_type = params$geo_type
-            ) %>%
-                rename(any_of(c(time_value = "reference_time", version = "report_time"))) %>%
-                filter(
-                    geo_value %in% archive_geos,
-                    time_value >= as.Date(archive_start),
-                    time_value <= as.Date(params$end_day)
-                )
-        }) %>% bind_rows()
-    } else {
-        # pub_covidcast accepts a signal vector and returns a signal column
-        df_archive_raw <- pub_covidcast(
-            source = params$source,
-            signal = signals_vec,
-            geo_type = params$geo_type,
-            time_type = params$time_type,
-            geo_values = archive_geos,
-            time_values = time_range(archive_start, params$end_day),
-            issues = "*",
-        )
-    }
+    df_archive_raw <- epidata_archive(
+        source = params$source,
+        signals = signals_vec,
+        geo_type = params$geo_type,
+        geo_values = archive_geos,
+        reference_time = epirange(archive_start, params$end_day)
+    )
 
     if (nrow(df_archive_raw) > 0) {
         # ponytail: no dedup here. Sources like NWSS can return several rows per
         # (geo, period, version) from different measurement sources, which
         # as_epi_archive() rejects; add a slice_max if one turns up.
-        df_archive_raw <- df_archive_raw %>%
-            rename(any_of(c(time_value = "reference_time", version = "issue"))) %>%
-            rename(any_of(c(version = "report_time"))) %>%
-            select(geo_value, time_value, version, any_of("signal"), any_of(params$extra_keys), value)
-
-        if ("version" %in% colnames(df_archive_raw)) {
-            archive_info$version_start <- min(df_archive_raw$version)
-            archive_info$version_end <- max(df_archive_raw$version)
-            candidate_archive <- as_epi_archive(df_archive_raw, other_keys = params$extra_keys,
-                signal_format = if ("signal" %in% names(df_archive_raw)) "add_key" else "as_is")
-        }
+        # signal goes in other_keys: signal_format = "add_key" ignores it when
+        # epiprocess merges same-day timestamp versions.
+        candidate_archive <- df_archive_raw %>%
+            select(geo_value, reference_time, report_time, any_of("signal"), any_of(params$extra_keys), value) %>%
+            as_epi_archive(other_keys = intersect(c("signal", params$extra_keys), names(.)))
+        archive_info$version_start <- min(candidate_archive$DT$version)
+        archive_info$version_end <- max(candidate_archive$DT$version)
     }
 }
 ```
@@ -1704,24 +1633,12 @@ crosswalk <- tryCatch(
 
 is_pct_indicator <- any(grepl("%|pct", name_vec, ignore.case = TRUE))
 
-fetch_coarser_candidate <- function(geo_type_coarser) {
-    tryCatch(
-        # pub_covidcast accepts a vector of signals
-        pub_covidcast(
-            params$source, signals_vec,
-            geo_type_coarser, params$time_type,
-            time_values = time_range(params$start_day, params$end_day),
-            as_of = Sys.Date()
-        ) %>% select(time_value, signal, geo_value, coarser_val = value),
-        error = function(e) NULL
-    )
-}
-
-# The HHS/nation series is unstratified, so only the aggregate stratum is
-# comparable. Pooling every stratum widens the bounds until nothing can fall
+# Only the aggregate stratum is comparable across geo levels. Pooling every stratum widens the bounds until nothing can fall
 # outside them and turns the state count into a row count.
 agg_stratum <- map(set_names(params$extra_keys), function(k) {
     lv <- unique(as.character(df_candidate[[k]]))
+    # For fill methods, compare the values the source reported itself.
+    if (k == "fill_method") return(if ("source" %in% lv) "source" else NA_character_)
     lv[tolower(lv) %in% agg_level_names][1]
 })
 strata_comparable <- all(!is.na(unlist(agg_stratum))) || length(params$extra_keys) == 0
@@ -1763,6 +1680,18 @@ check_aggregation <- function(df_coarser, group_label, state_to_coarser) {
         select(geo_level, indicator, time_value, coarser_geo, coarser_val, state_min, state_max, direction, n_states)
 }
 
+fetch_coarser_candidate <- function(geo_type_coarser) {
+    tryCatch(
+        epidata_snapshot(params$source, signals_vec, geo_type_coarser, reference_time = reference_window) %>%
+            {
+                if (strata_comparable) reduce(params$extra_keys, function(d, k) filter(d, .data[[k]] == agg_stratum[[k]]), .init = .)
+                else .
+            } %>%
+            select(time_value = reference_time, any_of("signal"), geo_value, coarser_val = value),
+        error = function(e) NULL
+    )
+}
+
 df_hhs_raw <- fetch_coarser_candidate("hhs")
 df_nation_raw <- fetch_coarser_candidate("nation")
 
@@ -1793,7 +1722,7 @@ if (length(unavailable) > 0) {
 strata_note <- if (length(params$extra_keys) == 0 || !strata_comparable) {
     ""
 } else {
-    sprintf(" The comparison uses the aggregate stratum (%s), the only one the unstratified HHS/nation series corresponds to.",
+    sprintf(" The comparison uses the aggregate stratum (%s), so the state and HHS/nation series cover the same population.",
             paste(sprintf("%s = %s", names(agg_stratum), unlist(agg_stratum)), collapse = ", "))
 }
 

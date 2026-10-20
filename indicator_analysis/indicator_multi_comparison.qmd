@@ -20,16 +20,12 @@ params:
   reference_indicators: !expr "character()"
   reference_names: !expr "character()"
   reference_csvs: !expr "NULL"
-  extra_keys: !expr "character()"
   # Shared settings
   geo_type:
-  time_type:
   start_day:
   end_day:
   # Maximum locations to show in plots/tables
   max_locations_plot: 12
-  api_timeout_seconds: 60
-  api_chunk_days: 30
 knitr:
   opts_chunk:
     comment: "#>"
@@ -53,38 +49,45 @@ execute:
 # When running interactively, populate params from defaults
 if (!exists("params")) {
     params <- list(
-        candidate_source = "doctor-visits",
-        candidate_indicator = "smoothed_adj_cli",
-        candidate_name = "Doctor Visits: Smoothed Adj CLI",
+        candidate_source = "nssp",
+        candidate_indicator = "pct_ed_visits_covid",
+        candidate_name = "NSSP: % ED Visits COVID",
         candidate_csv = NULL,
-        reference_sources = c("quidel", "hospital-admissions", "chng", "chng"),
+        reference_sources = c("nhsn", "claims_outpatient"),
         reference_indicators = c(
-            "covid_ag_smoothed_pct_positive",
-            "smoothed_covid19_from_claims",
-            "7dav_inpatient_covid",
-            "7dav_outpatient_covid"
+            "confirmed_admissions_covid_ew",
+            "claims_outpatient_ov_pct_claims_covid"
         ),
         reference_names = c(
-            "Quidel: Smoothed % Positive COVID Antigen",
-            "Hospital Admissions: Smoothed COVID-19 from Claims",
-            "CHNG: 7-day Avg Inpatient COVID",
-            "CHNG: 7-day Avg Outpatient COVID"
+            "NHSN: Confirmed COVID Admissions",
+            "Claims: % Outpatient Visits COVID"
         ),
         reference_csvs = NULL,
-        extra_keys = character(),
         geo_type = "state",
-        time_type = "day",
-        start_day = "2020-09-01",
-        end_day = "2023-03-01",
-        max_locations_plot = 12,
-        api_timeout_seconds = 60,
-        api_chunk_days = 30
+        start_day = format(Sys.Date() - 365 * 2),
+        end_day = format(Sys.Date()),
+        max_locations_plot = 12
     )
 }
 
+# Unlock params so blank dates can be filled in below.
+if (exists("params", envir = .GlobalEnv, inherits = FALSE) &&
+    bindingIsLocked("params", .GlobalEnv)) {
+    unlockBinding("params", .GlobalEnv)
+}
+# Optional date bounds
+start_date <- as.Date(params$start_day %||% "1900-01-01")
+end_date <- as.Date(params$end_day %||% format(Sys.Date()))
+reference_window <- if (is.null(params$start_day) && is.null(params$end_day)) NULL else epidatr::epirange(start_date, end_date)
+
 if (!require("pak")) install.packages("pak")
-if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delphi/epiprocess")
-if (!requireNamespace("epidatr", quietly = TRUE)) pak::pkg_install("cmu-delphi/epidatr")
+# The V5 API needs epidatr >= 1.4.0 and epiprocess >= 0.13.0.
+min_versions <- c(epidatr = "1.4.0", epiprocess = "0.13.0")
+for (pkg in names(min_versions)) {
+    if (!requireNamespace(pkg, quietly = TRUE) || packageVersion(pkg) < min_versions[[pkg]]) {
+        pak::pkg_install(paste0("cmu-delphi/", pkg, "@dev"))
+    }
+}
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess, covidcast,
@@ -135,19 +138,6 @@ options(
 )
 
 round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
-
-time_range <- function(start, end, time_type = params$time_type) {
-    if (time_type == "week") {
-        to_yw <- function(d) {
-            d <- as.Date(d)
-            m <- MMWRweek::MMWRweek(d)
-            m$MMWRyear * 100L + m$MMWRweek
-        }
-        epirange(to_yw(start), to_yw(end))
-    } else {
-        epirange(start, end)
-    }
-}
 
 geo_to_name <- function(geos, geo_type = params$geo_type) {
     if (geo_type == "state") {
@@ -330,16 +320,6 @@ add_lag_units <- function(d, lag, time_type) {
     }
 }
 
-new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-
-date_chunks <- function(start, end, chunk_days = params$api_chunk_days) {
-    starts <- seq.Date(as.Date(start), as.Date(end), by = sprintf("%d days", chunk_days))
-    tibble(
-        chunk_start = starts,
-        chunk_end = pmin(starts + chunk_days - 1, as.Date(end))
-    )
-}
-
 rename_first_available <- function(df, new_name, candidates) {
     if (new_name %in% names(df)) {
         return(df)
@@ -351,17 +331,13 @@ rename_first_available <- function(df, new_name, candidates) {
     rename(df, !!new_name := all_of(old_name))
 }
 
-canonicalize_indicator <- function(df, source, indicator, extra_keys = character()) {
+canonicalize_indicator <- function(df, source, indicator) {
     if (nrow(df) == 0 || ncol(df) == 0) {
-        out <- tibble(
+        return(tibble(
             geo_value = character(),
             time_value = as.Date(character()),
             value = double()
-        )
-        for (key in extra_keys) {
-            out[[key]] <- character()
-        }
-        return(out %>% select(geo_value, all_of(extra_keys), time_value, value))
+        ))
     }
 
     df <- df %>%
@@ -369,90 +345,40 @@ canonicalize_indicator <- function(df, source, indicator, extra_keys = character
         rename_first_available("time_value", c("reference_time", "time", "date")) %>%
         rename_first_available("value", c("signal_value", "estimate", "rate", "percent", "pct"))
 
-    missing_cols <- setdiff(c("geo_value", "time_value", "value", extra_keys), names(df))
+    missing_cols <- setdiff(c("geo_value", "time_value", "value"), names(df))
     if (length(missing_cols) > 0) {
         stop(glue(
             "Could not normalize {source}/{indicator}; missing columns: {paste(missing_cols, collapse = ', ')}"
         ))
     }
 
+    # fill_method rides along whenever present so load-data can check it.
     df %>%
         transmute(
             geo_value = as.character(geo_value),
-            across(all_of(extra_keys), as.character),
+            across(any_of("fill_method"), as.character),
             time_value = as.Date(time_value),
             value = as.numeric(value)
         )
 }
 
-load_indicator <- function(source, indicator, csv = NULL, extra_keys = character()) {
+load_indicator <- function(source, indicator, csv = NULL) {
     if (!is.null(csv) && !is.na(csv) && nzchar(csv)) {
         return(
             read.csv(csv) %>%
-                canonicalize_indicator(source, indicator, extra_keys = extra_keys) %>%
-                filter(
-                    time_value >= as.Date(params$start_day),
-                    time_value <= as.Date(params$end_day)
-                )
+                canonicalize_indicator(source, indicator) %>%
+                filter(time_value >= start_date, time_value <= end_date)
         )
     }
 
-    use_new_api <- FALSE
-    if (source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(source)
-                indicator %in% meta_res[[source]]$signals
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
-    }
+    out <- epidata_snapshot(
+        source = source,
+        signals = indicator,
+        geo_type = params$geo_type,
+        reference_time = reference_window
+    )
 
-    if (use_new_api) {
-        out <- epidata_snapshot(
-            source = source,
-            signals = indicator,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time")))
-
-        if ("fill_method" %in% colnames(out)) {
-            out <- out %>%
-                filter(fill_method == "source" | !any(fill_method == "source"))
-        }
-        if ("version" %in% colnames(out)) {
-            out <- out %>%
-                group_by(across(all_of(c("geo_value", extra_keys, "time_value")))) %>%
-                slice_max(version, n = 1, with_ties = FALSE) %>%
-                ungroup()
-        }
-
-        out %>%
-            canonicalize_indicator(source, indicator, extra_keys = extra_keys) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            )
-    } else {
-        date_chunks(params$start_day, params$end_day) %>%
-            pmap_dfr(function(chunk_start, chunk_end) {
-                pub_covidcast(
-                    source,
-                    indicator,
-                    params$geo_type,
-                    params$time_type,
-                    time_values = time_range(chunk_start, chunk_end),
-                    as_of = Sys.Date(),
-                    fetch_args = fetch_args_list(
-                        timeout_seconds = params$api_timeout_seconds,
-                        return_empty = TRUE
-                    )
-                ) %>%
-                    canonicalize_indicator(source, indicator, extra_keys = extra_keys)
-            }) %>%
-            distinct(across(all_of(c("geo_value", extra_keys, "time_value"))), .keep_all = TRUE)
-    }
+    canonicalize_indicator(out, source, indicator)
 }
 
 cache_path <- file.path(getwd(), "epidatr_cache")
@@ -485,7 +411,7 @@ if (is_blank_param(params$candidate_indicator)) {
     candidate_indicator <- as.character(params$candidate_indicator)[1]
 }
 
-required_shared <- c("geo_type", "time_type", "start_day", "end_day")
+required_shared <- "geo_type"
 missing_shared <- required_shared[map_lgl(required_shared, ~ is_blank_param(params[[.x]]))]
 if (length(missing_shared) > 0) {
     stop(glue("Missing required shared parameters: {paste(missing_shared, collapse = ', ')}"))
@@ -516,12 +442,7 @@ align_reference_param <- function(x, n, fill = NA_character_, param_name = "para
     x
 }
 
-extra_keys <- params$extra_keys %||% params$extra_key %||% character()
-if (is.null(extra_keys) || length(extra_keys) == 0 || all(is.na(extra_keys))) {
-    extra_keys <- character()
-}
-extra_keys <- unique(as.character(extra_keys[!is.na(extra_keys) & nzchar(extra_keys)]))
-key_cols <- c("geo_value", extra_keys)
+key_cols <- "geo_value"
 panel_cols <- c(key_cols, "time_value")
 reference_meta_cols <- c("reference_id", "reference_source", "reference_indicator", "reference_name", "reference_label")
 
@@ -574,11 +495,10 @@ config_tbl <- bind_rows(
 )
 
 nowrap_datatable(config_tbl, caption = sprintf(
-    "Geo-level: %s | Extra keys: %s | Period: %s to %s",
+    "Geo-level: %s | Period: %s to %s",
     params$geo_type,
-    if_else(length(extra_keys) == 0, "none", paste(extra_keys, collapse = ", ")),
-    params$start_day,
-    params$end_day
+    params$start_day %||% "first available",
+    params$end_day %||% "latest available"
 ), rownames = FALSE, options = list(scrollX = TRUE, dom = "t"))
 ```
 
@@ -588,14 +508,13 @@ nowrap_datatable(config_tbl, caption = sprintf(
 df_candidate <- load_indicator(
     source = candidate_source,
     indicator = candidate_indicator,
-    csv = params$candidate_csv,
-    extra_keys = extra_keys
+    csv = params$candidate_csv
 )
 
 df_references <- pmap_dfr(
     reference_specs,
     function(reference_source, reference_indicator, reference_name, reference_csv, reference_id, reference_label) {
-        load_indicator(reference_source, reference_indicator, reference_csv, extra_keys = extra_keys) %>%
+        load_indicator(reference_source, reference_indicator, reference_csv) %>%
             mutate(
                 reference_id = reference_id,
                 reference_source = reference_source,
@@ -605,6 +524,34 @@ df_references <- pmap_dfr(
             )
     }
 )
+
+# This notebook compares one series per location, so every indicator needs one
+# row per location and date and a single fill method per location. Sources
+# split by age group, for example, fail here.
+series_check <- bind_rows(
+    df_candidate %>% mutate(indicator_id = "candidate", indicator = candidate_name),
+    df_references %>% mutate(indicator_id = reference_id, indicator = reference_name)
+)
+if (!"fill_method" %in% names(series_check)) series_check$fill_method <- NA_character_
+mixed_series <- series_check %>%
+    summarize(
+        problem = anyDuplicated(time_value) > 0 || n_distinct(fill_method, na.rm = TRUE) > 1,
+        .by = c(indicator_id, indicator, geo_value)
+    ) %>%
+    filter(problem)
+if (nrow(mixed_series) > 0) {
+    cli::cli_abort(c(
+        "{.val {unique(mixed_series$indicator)}} {?has/have} more than one series per location (e.g. {.val {head(unique(mixed_series$geo_value), 3)}}): several rows per date, such as an age-group split, or several fill methods.",
+        "i" = "This notebook compares one series per location (geo_value).",
+        "i" = "Filter the indicator to one series and pass it as a CSV through {.arg candidate_csv} or {.arg reference_csvs}."
+    ))
+}
+df_candidate <- select(df_candidate, -any_of("fill_method"))
+df_references <- select(df_references, -any_of("fill_method"))
+
+# Blank start_day/end_day take the loaded data's range.
+params$start_day <- params$start_day %||% format(min(df_candidate$time_value, df_references$time_value))
+params$end_day <- params$end_day %||% format(max(df_candidate$time_value, df_references$time_value))
 
 cat(sprintf(
     "- **Candidate**: %s rows across %s locations  \n",
@@ -643,10 +590,15 @@ reference_load_tbl <- df_references %>%
 ```{r}
 #| label: combine-data
 #| include: false
-env_time_type <- attributes(df_candidate)$metadata$time_type
-if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
-    env_time_type <- params$time_type
+# epiprocess infers each indicator's time type
+infer_time_type <- function(df) {
+    attributes(suppressMessages(as_epi_df(select(df, geo_value, time_value, value))))$metadata$time_type
 }
+time_types <- c(
+    infer_time_type(df_candidate),
+    map_chr(split(df_references, df_references$reference_id), infer_time_type)
+)
+env_time_type <- if ("week" %in% time_types) "week" else time_types[[1]]
 
 if (env_time_type == "week") {
     df_candidate <- df_candidate %>%
@@ -1281,7 +1233,7 @@ summary_table <- location_summary %>%
         `Either missing` = sprintf("%.1f%%", pair_missing_pct)
     ) %>%
     select(
-        Reference, `Geo value`, any_of(extra_keys), `Geo name`, Periods,
+        Reference, `Geo value`, `Geo name`, Periods,
         `Candidate mean`, `Candidate missing`, `Reference mean`,
         `Reference missing`, `Either missing`
     )
@@ -1700,12 +1652,10 @@ if (!"geo_name" %in% names(cor_optimal_multi)) {
     cor_optimal_multi$geo_name <- geo_to_name(cor_optimal_multi$geo_value)
 }
 
-looks_like_state <- length(extra_keys) == 0 &&
-    params$geo_type == "state" &&
+looks_like_state <- params$geo_type == "state" &&
     nrow(cor_optimal_multi) > 0 &&
     all(nchar(cor_optimal_multi$geo_value) == 2)
-looks_like_county <- length(extra_keys) == 0 &&
-    params$geo_type == "county" &&
+looks_like_county <- params$geo_type == "county" &&
     nrow(cor_optimal_multi) > 0 &&
     all(nchar(cor_optimal_multi$geo_value) == 5)
 
@@ -1754,9 +1704,6 @@ if (nrow(cor_top) == 0) {
         `Spearman correlation` = double(),
         Rank = integer()
     )
-    for (key in extra_keys) {
-        cor_top[[key]] <- character()
-    }
 } else {
     cor_top <- cor_top %>%
         group_by(reference_name) %>%
@@ -1773,7 +1720,7 @@ if (nrow(cor_top) == 0) {
 }
 cor_top <- cor_top %>%
     select(
-        Reference, `Geo value`, any_of(extra_keys), `Geo name`,
+        Reference, `Geo value`, `Geo name`,
         `Optimal lag`, `Spearman correlation`, Rank
     )
 
@@ -1809,9 +1756,6 @@ if (nrow(weak_temporal_locations) == 0) {
         `Optimal lag` = integer(),
         `Temporal Spearman correlation` = double()
     )
-    for (key in extra_keys) {
-        weak_location_tbl[[key]] <- character()
-    }
 } else {
     weak_location_tbl <- weak_temporal_locations %>%
         mutate(
@@ -1824,7 +1768,7 @@ if (nrow(weak_temporal_locations) == 0) {
 }
 weak_location_tbl <- weak_location_tbl %>%
     select(
-        Reference, `Geo value`, any_of(extra_keys), `Geo name`,
+        Reference, `Geo value`, `Geo name`,
         `Optimal lag`, `Temporal Spearman correlation`
     )
 
