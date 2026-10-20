@@ -494,6 +494,8 @@ plot_series_dropdown <- function(df, trace_col = NULL, ci_cols = NULL) {
             title = list(text = paste0("Location: ", groups[1])),
             xaxis = list(title = "Date"),
             yaxis = list(title = "Value", range = yrange),
+            # Set explicitly. plotly otherwise decides from the first location
+            showlegend = !is.null(trace_col),
             legend = list(title = list(text = trace_col %||% "")),
             updatemenus = list(list(
                 type = "dropdown", active = 0, buttons = buttons, x = 0.05, y = 1.15
