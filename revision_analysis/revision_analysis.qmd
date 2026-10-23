@@ -16,11 +16,11 @@ params:
   signal: 
   signal_name: 
   # Optional path to a local CSV or Parquet directory with a version/issue column.
-  # When NULL, the signal is fetched from the Delphi API with issues = "*".
+  # When NULL, the signal's version history is fetched with epidata_archive().
   input_dir: !expr "NULL"
   # Shared settings
+  # Defaults to state when blank.
   geo_type:  
-  time_type: 
   start_day: 
   end_day:   
   # Maximum locations shown in faceted plots / summary tables.
@@ -60,14 +60,13 @@ execute:
 # When running interactively, fall back to the parameter defaults.
 if (!exists("params")) {
     params <- list(
-        source                = "hospital-admissions",
-        signal                = "smoothed_covid19_from_claims",
-        signal_name           = "Hospital Admissions: Smoothed COVID-19 from Claims",
-        input_dir             = "revision_analysis/data/revisions/",
+        source                = "nhsn",
+        signal                = "confirmed_admissions_covid_ew",
+        signal_name           = "NHSN: Confirmed COVID Admissions",
+        input_dir             = NULL,
         geo_type              = "state",
-        time_type             = "day",
-        start_day             = "2023-01-01",
-        end_day               = "2023-02-01",
+        start_day             = format(Sys.Date() - 365),
+        end_day               = format(Sys.Date()),
         max_locations_plot    = 6,
         max_locations_table   = 15,
         n_worst               = 18,
@@ -81,6 +80,22 @@ options(repos = c(
     delphi = "https://cmu-delphi.r-universe.dev",
     CRAN = "https://cloud.r-project.org"
 ))
+# Optional date bounds: a blank one is open-ended, and if both are blank the
+# V5 query gets no date filter at all.
+start_date <- as.Date(params$start_day %||% "1900-01-01")
+end_date <- as.Date(params$end_day %||% format(Sys.Date()))
+reference_window <- if (is.null(params$start_day) && is.null(params$end_day)) NULL else epidatr::epirange(start_date, end_date)
+geo_type <- params$geo_type %||% "state"
+
+# Load libraries
+if (!require("pak")) install.packages("pak")
+# The V5 API needs epidatr >= 1.4.0 and epiprocess >= 0.13.0.
+min_versions <- c(epidatr = "1.4.0", epiprocess = "0.13.0")
+for (pkg in names(min_versions)) {
+    if (!requireNamespace(pkg, quietly = TRUE) || packageVersion(pkg) < min_versions[[pkg]]) {
+        pak::pkg_install(paste0("cmu-delphi/", pkg, "@dev"))
+    }
+}
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess, covidcast,
@@ -163,26 +178,6 @@ tibble::tribble(
         updater(name, params)
     })
 
-# Helper: build epirange with correct format for the signal's time_type
-time_range <- function(start, end, time_type = params$time_type) {
-    if (time_type == "week") {
-        to_yw <- function(d) {
-            d <- as.Date(d)
-            m <- MMWRweek::MMWRweek(d)
-            m$MMWRyear * 100L + m$MMWRweek
-        }
-        epirange(to_yw(start), to_yw(end))
-    } else {
-        epirange(start, end)
-    }
-}
-
-as_revision_archive <- function(x) {
-    out <- as_epi_archive(x)
-    out$time_type <- params$time_type
-    out
-}
-
 # Set cache
 cache_path <- file.path(getwd(), "epidatr_cache")
 if (!dir.exists(cache_path)) dir.create(cache_path, recursive = TRUE)
@@ -240,10 +235,7 @@ if (!is.null(params$input_dir)) {
         cli::cli_inform("Reading data from directory: {.path {params$input_dir}}")
         raw <- arrow::open_dataset(path) %>%
             select(any_of(c("geo_value", "time_value", "version", "issue", "value"))) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            ) %>%
+            filter(time_value >= start_date, time_value <= end_date) %>%
             collect()
     } else if (grepl("\\.parquet$", path)) {
         cli::cli_inform("Reading Parquet file: {.path {params$input_dir}}")
@@ -271,85 +263,34 @@ if (!is.null(params$input_dir)) {
     if (!fs::is_dir(path)) {
         raw <- raw %>%
             mutate(version = as.Date(version)) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            )
+            filter(time_value >= start_date, time_value <= end_date)
     }
 
     archive <- raw %>%
         select(geo_value, time_value, version, value) %>%
-        as_revision_archive()
+        as_epi_archive()
 
     msg_verb <- "Loaded"
 } else {
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
+    df_raw <- epidata_archive(
+        source = params$source,
+        signals = params$signal,
+        geo_type = geo_type,
+        reference_time = reference_window,
+        # Only the values as reported by the source, so each time series has a
+        # single fill method and imputed/filled versions don't inflate the archive.
+        fill_method = "source"
+    )
 
-    if (params$source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$source)
-                params$signal %in% meta_res[[params$source]]$signals
-            },
-            error = function(e) {
-                FALSE
-            }
-        )
-        if (meta_available) {
-            use_new_api <- TRUE
-        }
-    }
-
-    if (use_new_api) {
-        df_raw <- epidata_archive(
-            source = params$source,
-            signals = params$signal,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time"))) %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            )
-    } else {
-        start_date <- as.Date(params$start_day)
-        end_date <- as.Date(params$end_day)
-        interval_starts <- seq(start_date, end_date, by = "month")
-        interval_ends <- pmin(
-            lubridate::ceiling_date(interval_starts, "month") - lubridate::days(1),
-            end_date
-        )
-
-        df_raw <- purrr::map2_dfr(interval_starts, interval_ends, function(s, e) {
-            cli::cli_inform(c(">" = "Fetching API revisions for {s} to {e}"))
-
-            pub_covidcast(
-                source = params$source,
-                signal = params$signal,
-                geo_type = params$geo_type,
-                time_type = params$time_type,
-                time_values = time_range(s, e),
-                issues = "*"
-            )
-        }) %>%
-            distinct()
-    }
-
-    if ("issue" %in% colnames(df_raw) && !"version" %in% colnames(df_raw)) {
-        df_raw <- rename(df_raw, version = issue)
-    }
-
-    if (nrow(df_raw) == 0 || !"version" %in% colnames(df_raw)) {
+    if (nrow(df_raw) == 0) {
         cli::cli_abort(
-            "No versioned data returned from the API. ",
-            "The signal may not support revision history."
+            "No versioned data with fill_method = \"source\" returned from the API. ",
+            "The signal may not support revision history at this geo_type."
         )
     }
-
     archive <- df_raw %>%
-        select(geo_value, time_value, version, value) %>%
-        as_revision_archive()
+        select(geo_value, reference_time, report_time, value) %>%
+        as_epi_archive()
 
     msg_verb <- "Fetched"
 }
@@ -388,8 +329,8 @@ config_tbl <- tibble(
         params$source,
         params$signal,
         params$signal_name,
-        params$geo_type,
-        params$time_type,
+        geo_type,
+        archive$time_type,
         paste(reference_start, "to", reference_end),
         paste(version_start, "to", version_end),
         paste(params$min_revision_history_days, "days"),
@@ -427,7 +368,7 @@ max_reference_date <- max(archive$DT$time_value, na.rm = TRUE)
 has_recent_reference_dates <- max_reference_date > stable_reference_cutoff
 diagnostic_archive <- archive$DT %>%
     filter(time_value <= stable_reference_cutoff) %>%
-    as_revision_archive()
+    as_epi_archive()
 ```
 
 ```{r}
@@ -631,7 +572,7 @@ plot_to_data_uri <- function(plot, width = 12, height = 8, dpi = 120) {
 }
 
 hhs_region_map <- tribble(
-    ~geo_value, ~hhs_region,
+    ~geo_value, ~geo_group,
     "ct", "HHS 1", "me", "HHS 1", "ma", "HHS 1", "nh", "HHS 1", "ri", "HHS 1", "vt", "HHS 1",
     "nj", "HHS 2", "ny", "HHS 2",
     "de", "HHS 3", "dc", "HHS 3", "md", "HHS 3", "pa", "HHS 3", "va", "HHS 3", "wv", "HHS 3",
@@ -643,6 +584,30 @@ hhs_region_map <- tribble(
     "az", "HHS 9", "ca", "HHS 9", "hi", "HHS 9", "nv", "HHS 9",
     "ak", "HHS 10", "id", "HHS 10", "or", "HHS 10", "wa", "HHS 10"
 )
+
+# Location groups for the paged and faceted location views: HHS regions when
+# the locations are states, otherwise alphabetical pages of max_locations_plot.
+# ponytail: one image per group, so thousands of locations (e.g. counties)
+# render slowly; subset the input with input_dir if that bites.
+geo_group_map <- tibble(geo_value = sort(unique(tolower(all_geos))))
+use_hhs_regions <- mean(geo_group_map$geo_value %in% hhs_region_map$geo_value) >= 0.5
+if (use_hhs_regions) {
+    geo_group_map <- geo_group_map %>%
+        left_join(hhs_region_map, by = "geo_value") %>%
+        mutate(geo_group = coalesce(geo_group, "Other"))
+    geo_groups <- intersect(c(paste("HHS", 1:10), "Other"), geo_group_map$geo_group)
+    geo_group_noun <- "HHS region"
+} else {
+    page_size <- params$max_locations_plot
+    page <- (seq_len(nrow(geo_group_map)) - 1) %/% page_size
+    geo_group_map$geo_group <- if (max(page) == 0) {
+        "All locations"
+    } else {
+        sprintf("Locations %d-%d", page * page_size + 1, pmin((page + 1) * page_size, nrow(geo_group_map)))
+    }
+    geo_groups <- unique(geo_group_map$geo_group)
+    geo_group_noun <- "location group"
+}
 ```
 
 ## Results at a glance {#overall .unnumbered}
@@ -693,7 +658,7 @@ report_lag_cols <- setNames(
 report_lag_date_end <- max(report_lag_timeseries$time_value, na.rm = TRUE)
 
 report_lag_subtitle_base <- paste(
-    "Each line shows the selected state's Report value available as of the selected lag.",
+    "Each line shows the selected location's Report value available as of the selected lag.",
     "Observed values are carried forward between reports; retained pairs satisfy the initial report lag cutoff.",
     sep = "\n"
 )
@@ -927,7 +892,7 @@ This heatmap shows the Relative Error surface over daily reference date and as-o
 lag. Each location-reference-date trajectory is carried forward between observed
 reports: if no new report was issued at a lag, the previous Report value remains
 the as-of value for that lag. Each cell summarizes the mean Relative Error across
-all states for the same reference date and as-of lag. Epi seasons are shown one
+all locations for the same reference date and as-of lag. Epi seasons are shown one
 page at a time, with the most recent epi season first. White cells mean that no
 Report value was available yet for that reference-date and lag combination, so
 they should be read as missing data rather than zero Relative Error.
@@ -1014,7 +979,7 @@ plot_relative_error_heatmap <- function(season_value) {
         ) +
         labs(
             title = sprintf("Relative Error heatmap: %s", season_value),
-            subtitle = "Cells show mean Relative Error across all states; white cells indicate no available report.",
+            subtitle = "Cells show mean Relative Error across all locations; white cells indicate no available report.",
             x = "Reference month",
             y = "Lag (days)",
             fill = "Relative Error"
@@ -1710,42 +1675,24 @@ ggplot() +
 Revision behavior can vary by geography. This section first compares the total
 amount of revision activity and lag by location, then compares
 how long each location takes to reach the stability thresholds used above.
-Locations are grouped by HHS region (U.S. Department of Health and Human
-Services region).
+Locations are grouped by `r geo_group_noun`.
 
 ```{r}
 #| label: rev-beh-by-loc-compute
-hhs_geo_order <- hhs_region_map %>%
-    mutate(
-        hhs_region = factor(hhs_region, levels = paste("HHS", 1:10)),
-        geo_value = tolower(geo_value)
-    ) %>%
+geo_group_order <- geo_group_map %>%
+    mutate(geo_group = factor(geo_group, levels = geo_groups)) %>%
     filter(geo_value %in% unique(tolower(stability_combined$geo_value))) %>%
-    arrange(hhs_region, geo_value) %>%
+    arrange(geo_group, geo_value) %>%
     mutate(
         x_pos = row_number(),
         geo_label = toupper(geo_value),
-        hhs_label = str_replace(as.character(hhs_region), "HHS ", "HHS\nRegion ")
+        geo_group_label = str_replace(as.character(geo_group), "HHS ", "HHS\nRegion ")
     )
 
-unmapped_geos <- setdiff(unique(tolower(stability_combined$geo_value)), hhs_geo_order$geo_value)
-if (length(unmapped_geos) > 0) {
-    hhs_geo_order <- bind_rows(
-        hhs_geo_order,
-        tibble(
-            geo_value = sort(unmapped_geos),
-            hhs_region = factor("Other", levels = c(paste("HHS", 1:10), "Other")),
-            x_pos = seq(nrow(hhs_geo_order) + 1, nrow(hhs_geo_order) + length(unmapped_geos)),
-            geo_label = toupper(sort(unmapped_geos)),
-            hhs_label = "Other"
-        )
-    )
-}
+geo_sorting <- geo_group_order$geo_value
 
-geo_sorting <- hhs_geo_order$geo_value
-
-hhs_region_bounds <- hhs_geo_order %>%
-    group_by(hhs_region, hhs_label) %>%
+geo_group_bounds <- geo_group_order %>%
+    group_by(geo_group, geo_group_label) %>%
     summarize(
         xmin = min(x_pos),
         xmax = max(x_pos),
@@ -1753,8 +1700,8 @@ hhs_region_bounds <- hhs_geo_order %>%
         .groups = "drop"
     )
 
-hhs_bracket_plot <- function() {
-    ggplot(hhs_region_bounds) +
+geo_group_bracket_plot <- function() {
+    ggplot(geo_group_bounds) +
         geom_segment(
             aes(x = xmin, xend = xmax, y = 0.72, yend = 0.72),
             color = "gray45",
@@ -1771,17 +1718,17 @@ hhs_bracket_plot <- function() {
             linewidth = 0.55
         ) +
         geom_text(
-            aes(x = xmid, y = 0.22, label = hhs_label),
+            aes(x = xmid, y = 0.22, label = geo_group_label),
             size = 3.5,
             fontface = "bold",
             color = "gray20"
         ) +
         scale_x_continuous(
-            limits = range(hhs_geo_order$x_pos) + c(-0.5, 0.5),
+            limits = range(geo_group_order$x_pos) + c(-0.5, 0.5),
             expand = expansion(mult = c(0.01, 0.01))
         ) +
         coord_cartesian(ylim = c(0, 1), clip = "off") +
-        labs(x = "Location ordered by HHS region") +
+        labs(x = paste("Location ordered by", geo_group_noun)) +
         theme_void() +
         theme(
             axis.title.x = element_text(size = 13, face = "bold", margin = margin(t = 14)),
@@ -1804,25 +1751,23 @@ rev_by_loc <- rev_beh %>%
     )
 ```
 
-### Cumulative stabilization by Relative Error threshold by HHS region
+### Cumulative stabilization by Relative Error threshold by `r geo_group_noun`
 
-For each state, the curve shows the fraction of location-reference-date pairs that have settled
+For each location, the curve shows the fraction of location-reference-date pairs that have settled
 within each Relative Error threshold by a given lag and never left it. The view
-is paged by HHS region (U.S. Department of Health and Human Services region).
-Each small panel is one state. Lines and stacked bands use the same nested
-threshold colors as Section 2.1; compare panels to see whether states in the
-same HHS region stabilize at similar lags.
+is paged by `r geo_group_noun`. Each small panel is one location. Lines and
+stacked bands use the same nested threshold colors as Section 2.1; compare
+panels to see whether locations in the same `r geo_group_noun` stabilize at
+similar lags.
 
 ```{r}
-#| label: cumulative-stabilization-by-hhs-state
+#| label: cumulative-stabilization-by-location-group
 #| echo: false
 #| results: asis
 #| cache: true
-hhs_regions <- paste("HHS", 1:10)
-
-hhs_panel_html <- map_chr(hhs_regions, function(region_name) {
-    region_geos <- hhs_geo_order %>%
-        filter(as.character(hhs_region) == region_name) %>%
+geo_group_panel_html <- map_chr(geo_groups, function(region_name) {
+    region_geos <- geo_group_order %>%
+        filter(as.character(geo_group) == region_name) %>%
         pull(geo_value)
 
     state_plots <- map(region_geos, function(geo) {
@@ -1839,7 +1784,7 @@ hhs_panel_html <- map_chr(hhs_regions, function(region_name) {
         plot_layout(heights = c(0.22, 1), guides = "collect") +
         plot_annotation(
             title = sprintf("Cumulative stabilization by Relative Error threshold: %s", region_name),
-            subtitle = sprintf("Each panel is one state; colors show nested Relative Error thresholds. Lags 0-%d days.", focus_days)
+            subtitle = sprintf("Each panel is one location; colors show nested Relative Error thresholds. Lags 0-%d days.", focus_days)
         )
 
     image_uri <- plot_to_data_uri(
@@ -1848,9 +1793,9 @@ hhs_panel_html <- map_chr(hhs_regions, function(region_name) {
         height = max(6, 3.6 * ceiling(length(region_geos) / 2) + 1.6)
     )
 
-    display <- ifelse(region_name == hhs_regions[1], "block", "none")
+    display <- ifelse(region_name == geo_groups[1], "block", "none")
     sprintf(
-        '<div class="hhs-cumulative-panel" data-region="%s" style="display:%s;"><img src="%s" style="width:100%%;" alt="%s cumulative stabilization by state"></div>',
+        '<div class="hhs-cumulative-panel" data-region="%s" style="display:%s;"><img src="%s" style="width:100%%;" alt="%s cumulative stabilization by location"></div>',
         region_name, display, image_uri, region_name
     )
 })
@@ -1861,11 +1806,11 @@ control_html <- paste0(
     '<div class="hhs-page-buttons">',
     paste0(
         '<button type="button" class="hhs-page-button" data-region="',
-        hhs_regions,
+        geo_groups,
         '" data-page="',
-        seq_along(hhs_regions),
+        seq_along(geo_groups),
         '">',
-        seq_along(hhs_regions),
+        seq_along(geo_groups),
         '</button>',
         collapse = ""
     ),
@@ -1963,27 +1908,27 @@ style_html <- paste(
 
 cat(paste(
     control_html,
-    paste(hhs_panel_html, collapse = "\n"),
+    paste(geo_group_panel_html, collapse = "\n"),
     script_html,
     style_html,
     sep = "\n"
 ))
 ```
 
-### Relative Error by HHS region
+### Relative Error by `r geo_group_noun`
 
-This view shows how Relative Error changes with lag within each HHS region.
-Each panel is one HHS region, each line is a state median, and each shaded band
-is the 25th-75th percentile range for that state.
+This view shows how Relative Error changes with lag within each `r geo_group_noun`.
+Each panel is one `r geo_group_noun`, each line is a location median, and each
+shaded band is the 25th-75th percentile range for that location.
 
 ```{r}
 #| label: convergence-location-plot
-#| fig-height: 22
+#| fig-height: !expr max(5, 4.4 * ceiling(length(geo_groups) / 2))
 #| cache: true
 region_conv <- convergence_df %>%
     mutate(geo_value = tolower(geo_value)) %>%
-    inner_join(hhs_region_map, by = "geo_value") %>%
-    group_by(hhs_region, geo_value, publication_lag) %>%
+    inner_join(geo_group_map, by = "geo_value") %>%
+    group_by(geo_group, geo_value, publication_lag) %>%
     summarize(
         q25_rel_diff = quantile(abs_rel_diff, 0.25, na.rm = TRUE),
         median_rel_diff = median(abs_rel_diff, na.rm = TRUE),
@@ -1994,13 +1939,13 @@ region_conv <- convergence_df %>%
     filter(n_reports > 1) %>%
     filter(publication_lag <= convergence_focus_days) %>%
     mutate(
-        hhs_region = factor(hhs_region, levels = paste("HHS", 1:10)),
+        geo_group = factor(geo_group, levels = geo_groups),
         geo_value = factor(geo_value, levels = sort(unique(geo_value)))
     )
 
-plot_hhs_region <- function(region_name) {
+plot_geo_group <- function(region_name) {
     region_data <- region_conv %>%
-        filter(hhs_region == region_name) %>%
+        filter(geo_group == region_name) %>%
         mutate(geo_value = droplevels(geo_value))
 
     state_levels <- levels(region_data$geo_value)
@@ -2042,13 +1987,13 @@ plot_hhs_region <- function(region_name) {
         guides(color = guide_legend(nrow = 2, byrow = TRUE))
 }
 
-region_plots <- lapply(paste("HHS", 1:10), plot_hhs_region)
+region_plots <- lapply(geo_groups, plot_geo_group)
 
 wrap_plots(region_plots, ncol = 2) +
     plot_annotation(
-        title = "Relative Error by HHS region",
+        title = paste("Relative Error by", geo_group_noun),
         subtitle = sprintf(
-            "Relative Error across lags 0-%d days; lines show state-level medians and shaded bands show 25th-75th percentile ranges.",
+            "Relative Error across lags 0-%d days; lines show location-level medians and shaded bands show 25th-75th percentile ranges.",
             convergence_focus_days
         )
     )
@@ -2059,7 +2004,7 @@ wrap_plots(region_plots, ncol = 2) +
 This is the location-level version of the stabilization-time distribution from
 Section 2.2. Each point is the median time to reach a threshold for one
 location; each vertical line is the 25th-75th percentile range. The main reading
-is across states: compare whether some locations consistently need longer lags
+is across locations: compare whether some locations consistently need longer lags
 to reach the same threshold. The `0%` threshold means the Report value has
 matched the latest Report value, while the other thresholds allow nonzero
 Relative Error.
@@ -2073,7 +2018,7 @@ Relative Error.
 location_maturation_df <- stability_combined %>%
     filter(!is.na(lag_stable), !is.na(threshold)) %>%
     mutate(geo_value = tolower(geo_value)) %>%
-    inner_join(hhs_geo_order, by = "geo_value") %>%
+    inner_join(geo_group_order, by = "geo_value") %>%
     mutate(
         geo_value = factor(geo_value, levels = geo_sorting)
     ) %>%
@@ -2091,8 +2036,8 @@ location_maturation_plot <- ggplot(
 ) +
     geom_pointrange(position = position_dodge(width = 0.7), linewidth = 0.45, size = 0.9) +
     scale_x_continuous(
-        breaks = hhs_geo_order$x_pos,
-        labels = hhs_geo_order$geo_label,
+        breaks = geo_group_order$x_pos,
+        labels = geo_group_order$geo_label,
         expand = expansion(mult = c(0.01, 0.01))
     ) +
     scale_y_continuous(
@@ -2111,7 +2056,7 @@ location_maturation_plot <- ggplot(
         axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 11, face = "bold")
     )
 
-location_maturation_plot / hhs_bracket_plot() + plot_layout(heights = c(12, 2.1))
+location_maturation_plot / geo_group_bracket_plot() + plot_layout(heights = c(12, 2.1))
 ```
 
 ---
@@ -2581,12 +2526,12 @@ evidence about long-lag behavior.
 #| fig-height: 5
 #| eval: !expr n_locations > 3
 revisions_by_location_plot <- rev_by_loc %>%
-    inner_join(hhs_geo_order, by = "geo_value") %>%
-    ggplot(aes(x = x_pos, y = total_revisions, fill = hhs_region)) +
+    inner_join(geo_group_order, by = "geo_value") %>%
+    ggplot(aes(x = x_pos, y = total_revisions, fill = geo_group)) +
     geom_col(width = 0.82, alpha = 0.88) +
     scale_x_continuous(
-        breaks = hhs_geo_order$x_pos,
-        labels = hhs_geo_order$geo_label,
+        breaks = geo_group_order$x_pos,
+        labels = geo_group_order$geo_label,
         expand = expansion(mult = c(0.01, 0.01))
     ) +
     scale_y_continuous(labels = label_comma(), breaks = breaks_pretty()) +
@@ -2595,7 +2540,7 @@ revisions_by_location_plot <- rev_by_loc %>%
         subtitle = "Total revision events across all reference dates",
         x = NULL,
         y = "Number of revisions",
-        fill = "HHS region"
+        fill = geo_group_noun
     ) +
     guides(fill = "none") +
     theme(
@@ -2603,13 +2548,13 @@ revisions_by_location_plot <- rev_by_loc %>%
         legend.position = "none"
     )
 
-revisions_by_location_plot / hhs_bracket_plot() + plot_layout(heights = c(12, 2.1))
+revisions_by_location_plot / geo_group_bracket_plot() + plot_layout(heights = c(12, 2.1))
 ```
 
 ### Lag distribution by location
 
-The diagnostic below shows the distribution of lag for all states in
-the selected HHS region. Here, lag is the number of days between the reference
+The diagnostic below shows the distribution of lag for all locations in
+the selected `r geo_group_noun`. Here, lag is the number of days between the reference
 date and the report date. The split between first reports and later reports
 helps separate initial reporting timing from later revisions.
 
@@ -2630,11 +2575,9 @@ backfill_df <- analyzed_report_df %>%
 #| echo: false
 #| results: asis
 #| cache: true
-lag_hhs_regions <- paste("HHS", 1:10)
-
-lag_panel_html <- map_chr(lag_hhs_regions, function(region_name) {
-    region_geos <- hhs_geo_order %>%
-        filter(as.character(hhs_region) == region_name) %>%
+lag_panel_html <- map_chr(geo_groups, function(region_name) {
+    region_geos <- geo_group_order %>%
+        filter(as.character(geo_group) == region_name) %>%
         pull(geo_value)
 
     lag_plot <- backfill_df %>%
@@ -2666,9 +2609,9 @@ lag_panel_html <- map_chr(lag_hhs_regions, function(region_name) {
         height = max(6, 3.4 * ceiling(length(region_geos) / 2) + 1.6)
     )
 
-    display <- ifelse(region_name == lag_hhs_regions[1], "block", "none")
+    display <- ifelse(region_name == geo_groups[1], "block", "none")
     sprintf(
-        '<div class="lag-hhs-panel" data-region="%s" style="display:%s;"><img src="%s" style="width:100%%;" alt="%s lag by state"></div>',
+        '<div class="lag-hhs-panel" data-region="%s" style="display:%s;"><img src="%s" style="width:100%%;" alt="%s lag by location"></div>',
         region_name, display, image_uri, region_name
     )
 })
@@ -2679,11 +2622,11 @@ lag_control_html <- paste0(
     '<div class="lag-page-buttons">',
     paste0(
         '<button type="button" class="lag-page-button" data-region="',
-        lag_hhs_regions,
+        geo_groups,
         '" data-page="',
-        seq_along(lag_hhs_regions),
+        seq_along(geo_groups),
         '">',
-        seq_along(lag_hhs_regions),
+        seq_along(geo_groups),
         '</button>',
         collapse = ""
     ),

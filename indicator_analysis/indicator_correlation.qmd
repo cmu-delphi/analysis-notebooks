@@ -22,7 +22,6 @@ params:
   candidate_csv: !expr "NULL"
   # Shared settings
   geo_type:
-  time_type:
   start_day:
   end_day:
   max_locations_plot: 60
@@ -56,13 +55,12 @@ if (!exists("params")) {
         guiding_name = "COVID Hospital Admissions (NHSN)",
         guiding_csv = NULL,
         # Candidate Indicator,
-        candidate_source = "beta_pophive",
-        candidate_indicator = "epic_pct_covid_total",
-        candidate_name = "PopHive: Epic % COVID Total",
+        candidate_source = "nssp",
+        candidate_indicator = "pct_ed_visits_covid",
+        candidate_name = "NSSP: % ED Visits COVID",
         candidate_csv = NULL,
         # Shared settings,
         geo_type = "state",
-        time_type = NULL,
         end_day = format(Sys.Date()),
         start_day = format(Sys.Date() - 365 * 2),
         max_locations_plot = 6,
@@ -96,7 +94,6 @@ params$candidate_source  <- flatten_param(params$candidate_source)
 params$candidate_indicator <- flatten_param(params$candidate_indicator)
 params$candidate_name    <- flatten_param(params$candidate_name)
 params$geo_type          <- flatten_param(params$geo_type)
-params$time_type         <- flatten_param(params$time_type)
 params$guiding_csv       <- flatten_param(params$guiding_csv)
 params$candidate_csv     <- flatten_param(params$candidate_csv)
 
@@ -144,16 +141,24 @@ if (!is.null(params$candidate_csv) &&
 # Name defaults
 if (is.null(params$guiding_name) || !nzchar(params$guiding_name)) params$guiding_name <- params$guiding_indicator
 if (is.null(params$candidate_name) || !nzchar(params$candidate_name)) params$candidate_name <- params$candidate_indicator
-if (is.null(params$end_day) || !nzchar(params$end_day)) params$end_day <- format(Sys.Date())
-if (is.null(params$start_day) || !nzchar(params$start_day)) params$start_day <- format(as.Date(params$end_day) - 365 * 2)
+# Optional date bounds
+start_date <- as.Date(params$start_day %||% "1900-01-01")
+end_date <- as.Date(params$end_day %||% format(Sys.Date()))
+reference_window <- if (is.null(params$start_day) && is.null(params$end_day)) NULL else epidatr::epirange(start_date, end_date)
 
 # Load libraries
 if (!require("pak")) install.packages("pak")
-if (!requireNamespace("epiprocess", quietly = TRUE)) pak::pkg_install("cmu-delphi/epiprocess@dev")
+# The V5 API needs epidatr >= 1.4.0 and epiprocess >= 0.13.0.
+min_versions <- c(epidatr = "1.4.0", epiprocess = "0.13.0")
+for (pkg in names(min_versions)) {
+    if (!requireNamespace(pkg, quietly = TRUE) || packageVersion(pkg) < min_versions[[pkg]]) {
+        pak::pkg_install(paste0("cmu-delphi/", pkg, "@dev"))
+    }
+}
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
     epidatr, epiprocess,
-    tidyverse, scales, patchwork,
+    tidyverse, stringr, scales, patchwork,
     here, glue, ggtext
 )
 
@@ -261,18 +266,24 @@ tibble::tribble(
 # Helper: round any date to the immediately preceding Sunday (or same day if already Sunday)
 round_to_sunday <- function(d) d - as.integer(format(d, "%w"))
 
-# Helper: build epirange with correct format for the indicator's time_type
-time_range <- function(start, end, time_type = params$time_type) {
-    if (time_type == "week") {
-        to_yw <- function(d) {
-            d <- as.Date(d)
-            m <- MMWRweek::MMWRweek(d)
-            m$MMWRyear * 100L + m$MMWRweek
-        }
-        epirange(to_yw(start), to_yw(end))
-    } else {
-        epirange(start, end)
+# Helper: latest V5 snapshot of one signal
+fetch_snapshot <- function(source, signal) {
+    df <- epidata_snapshot(source = source, signals = signal, geo_type = params$geo_type,
+                           reference_time = reference_window)
+    mixed_geos <- df %>%
+        summarize(problem = anyDuplicated(reference_time) > 0 || n_distinct(fill_method) > 1, .by = geo_value) %>%
+        filter(problem) %>%
+        pull(geo_value)
+    if (length(mixed_geos) > 0) {
+        cli::cli_abort(c(
+            "{source}/{signal} has more than one series per location (e.g. {.val {head(mixed_geos, 3)}}): several rows per date or several fill methods.",
+            "i" = "This notebook compares one series per location (geo_value).",
+            "i" = "Filter it to one series and pass it as a CSV through {.arg guiding_csv} or {.arg candidate_csv}."
+        ))
     }
+    df %>%
+        select(geo_value, reference_time, value) %>%
+        as_epi_df()
 }
 
 # Helper: map geo codes to readable names
@@ -341,9 +352,9 @@ config_tbl <- tibble(
 )
 
 caption_str <- if (is.null(params$geo_type) || !nzchar(params$geo_type)) {
-    sprintf("Period: %s to %s", params$start_day, params$end_day)
+    sprintf("Period: %s to %s", params$start_day %||% "first available", params$end_day %||% "latest available")
 } else {
-    sprintf("Geo-level: %s | Period: %s to %s", params$geo_type, params$start_day, params$end_day)
+    sprintf("Geo-level: %s | Period: %s to %s", params$geo_type, params$start_day %||% "first available", params$end_day %||% "latest available")
 }
 
 DT::datatable(config_tbl, caption = caption_str, rownames = FALSE, options = list(scrollX = TRUE, dom = "t"))
@@ -363,57 +374,12 @@ DT::datatable(config_tbl, caption = caption_str, rownames = FALSE, options = lis
 #| output: asis
 # Load guiding indicator
 if (!is.null(params$guiding_csv)) {
-    df_guiding <- read.csv(params$guiding_csv) %>%
+    df_guiding <- read.csv(params$guiding_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
-        filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day)) %>%
+        filter(time_value >= start_date, time_value <= end_date) %>%
         as_epi_df()
 } else {
-    # Determine if new API can be used for guiding source
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
-    if (params$guiding_source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$guiding_source)
-                params$guiding_indicator %in% meta_res[[params$guiding_source]]$signals
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
-    }
-    if (use_new_api) {
-        df_guiding <- epidata_snapshot(
-            source = params$guiding_source,
-            signals = params$guiding_indicator,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time")))
-        if ("fill_method" %in% colnames(df_guiding)) {
-            df_guiding <- df_guiding %>%
-                filter(fill_method == "source" | !any(fill_method == "source"))
-        }
-        if ("version" %in% colnames(df_guiding)) {
-            df_guiding <- df_guiding %>%
-                group_by(geo_value, time_value) %>%
-                slice_max(version, n = 1, with_ties = FALSE) %>%
-                ungroup()
-        }
-        df_guiding <- df_guiding %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            ) %>%
-            rename(any_of(c(time_value = "reference_time"))) %>%
-            select(geo_value, time_value, value) %>%
-            as_epi_df()
-    } else {
-        df_guiding <- pub_covidcast(
-            params$guiding_source, params$guiding_indicator,
-            params$geo_type, params$time_type,
-            time_values = time_range(params$start_day, params$end_day),
-            as_of = Sys.Date()
-        ) %>% as_epi_df()
-    }
+    df_guiding <- fetch_snapshot(params$guiding_source, params$guiding_indicator)
 }
 
 cat(sprintf(
@@ -428,9 +394,9 @@ cat(sprintf(
 # Load candidate indicator
 candidate_archive <- NULL
 if (!is.null(params$candidate_csv)) {
-    df_candidate_raw <- read.csv(params$candidate_csv) %>%
+    df_candidate_raw <- read.csv(params$candidate_csv, colClasses = c(geo_value = "character")) %>%
         mutate(time_value = as.Date(time_value)) %>%
-        filter(time_value >= as.Date(params$start_day) & time_value <= as.Date(params$end_day))
+        filter(time_value >= start_date, time_value <= end_date)
 
     # CSV may include version/issue columns for revision analysis
     has_versions <- any(c("version", "issue") %in% colnames(df_candidate_raw))
@@ -452,52 +418,7 @@ if (!is.null(params$candidate_csv)) {
         df_candidate <- df_candidate_raw %>% as_epi_df()
     }
 } else {
-    # Determine if new API can be used for candidate source
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
-    if (params$candidate_source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$candidate_source)
-                params$candidate_indicator %in% meta_res[[params$candidate_source]]$signals
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
-    }
-    if (use_new_api) {
-        df_candidate <- epidata_snapshot(
-            source = params$candidate_source,
-            signals = params$candidate_indicator,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time")))
-        if ("fill_method" %in% colnames(df_candidate)) {
-            df_candidate <- df_candidate %>%
-                filter(fill_method == "source" | !any(fill_method == "source"))
-        }
-        if ("version" %in% colnames(df_candidate)) {
-            df_candidate <- df_candidate %>%
-                group_by(geo_value, time_value) %>%
-                slice_max(version, n = 1, with_ties = FALSE) %>%
-                ungroup()
-        }
-        df_candidate <- df_candidate %>%
-            filter(
-                time_value >= as.Date(params$start_day),
-                time_value <= as.Date(params$end_day)
-            ) %>%
-            rename(any_of(c(time_value = "reference_time"))) %>%
-            select(geo_value, time_value, value) %>%
-            as_epi_df()
-    } else {
-        df_candidate <- pub_covidcast(
-            params$candidate_source, params$candidate_indicator,
-            params$geo_type, params$time_type,
-            time_values = time_range(params$start_day, params$end_day),
-            as_of = Sys.Date()
-        ) %>% as_epi_df()
-    }
+    df_candidate <- fetch_snapshot(params$candidate_source, params$candidate_indicator)
 }
 
 cat(sprintf(
@@ -505,16 +426,15 @@ cat(sprintf(
     label_comma()(nrow(df_candidate)), label_comma()(n_distinct(df_candidate$geo_value))
 ))
 
-# Infer time type and geo type from guiding (defaults/overrides resolved here before archive query)
-env_time_type <- attributes(df_guiding)$metadata$time_type
-if (is.null(env_time_type) || length(env_time_type) != 1 || is.na(env_time_type) || !is.character(env_time_type)) {
-    env_time_type <- params$time_type
-}
-if (is.null(env_time_type) || !nzchar(env_time_type)) {
-    env_time_type <- "day"
-}
-params$time_type <- env_time_type
+# epiprocess infers each indicator's time type
+time_types <- c(attributes(df_guiding)$metadata$time_type, attributes(df_candidate)$metadata$time_type)
+env_time_type <- if ("week" %in% time_types) "week" else time_types[[1]]
 
+# Blank start_day/end_day take the loaded data's range.
+params$start_day <- params$start_day %||% format(min(df_guiding$time_value, df_candidate$time_value))
+params$end_day <- params$end_day %||% format(max(df_guiding$time_value, df_candidate$time_value))
+
+# Infer geo type from guiding
 env_geo_type <- attributes(df_guiding)$metadata$geo_type
 if (is.null(params$geo_type) || length(params$geo_type) != 1 || is.na(params$geo_type) || !is.character(params$geo_type)) {
     params$geo_type <- env_geo_type
@@ -529,7 +449,7 @@ if (is.null(candidate_archive) && is.null(params$candidate_csv)) {
     all_geos <- unique(df_candidate$geo_value)
     archive_geos <- random_sample(all_geos, params$max_archive_locs)
     # Adjust lookback window
-    lookback <- switch(params$time_type,
+    lookback <- switch(env_time_type,
         "day" = lubridate::weeks(31),
         "week" = lubridate::weeks(150),
         "month" = lubridate::months(36),
@@ -548,57 +468,21 @@ if (is.null(candidate_archive) && is.null(params$candidate_csv)) {
         time_value_end = params$end_day
     )
 
-    # Request only for the sampled locations and the relevant time range
-    # to avoid server-side timeouts/errors on large indicators.
-    # Determine if new API can be used for candidate source archive
-    new_api_sources <- c("nssp", "nhsn", "pophive", "nwss", "claims_data_outpatient")
-    use_new_api <- FALSE
-    if (params$candidate_source %in% new_api_sources) {
-        meta_available <- tryCatch(
-            {
-                meta_res <- epidata_meta(params$candidate_source)
-                params$candidate_indicator %in% meta_res[[params$candidate_source]]$signals
-            },
-            error = function(e) FALSE
-        )
-        if (meta_available) use_new_api <- TRUE
-    }
-    if (use_new_api) {
-        df_archive_raw <- epidata_archive(
-            source = params$candidate_source,
-            signals = params$candidate_indicator,
-            geo_type = params$geo_type
-        ) %>%
-            rename(any_of(c(time_value = "reference_time", version = "report_time"))) %>%
-            filter(
-                geo_value %in% archive_geos,
-                time_value >= as.Date(archive_start),
-                time_value <= as.Date(params$end_day)
-            )
-    } else {
-        df_archive_raw <- pub_covidcast(
-            source = params$candidate_source,
-            signal = params$candidate_indicator,
-            geo_type = params$geo_type,
-            time_type = params$time_type,
-            geo_values = archive_geos,
-            time_values = time_range(archive_start, params$end_day),
-            issues = "*",
-        )
-    }
+    # Request only the sampled locations and the relevant time range.
+    df_archive_raw <- epidata_archive(
+        source = params$candidate_source,
+        signals = params$candidate_indicator,
+        geo_type = params$geo_type,
+        geo_values = archive_geos,
+        reference_time = epirange(archive_start, params$end_day)
+    )
 
     if (nrow(df_archive_raw) > 0) {
-        df_archive_raw <- df_archive_raw %>%
-            rename(any_of(c(time_value = "reference_time", version = "issue"))) %>%
-            rename(any_of(c(version = "report_time"))) %>%
-            select(geo_value, time_value, version, value)
-
-        if ("version" %in% colnames(df_archive_raw)) {
-            archive_info$version_start <- min(df_archive_raw$version)
-            archive_info$version_end <- max(df_archive_raw$version)
-            candidate_archive <- df_archive_raw %>%
-                as_epi_archive()
-        }
+        candidate_archive <- df_archive_raw %>%
+            select(geo_value, reference_time, report_time, value) %>%
+            as_epi_archive()
+        archive_info$version_start <- min(candidate_archive$DT$version)
+        archive_info$version_end <- max(candidate_archive$DT$version)
     }
 }
 ```
@@ -606,9 +490,6 @@ if (is.null(candidate_archive) && is.null(params$candidate_csv)) {
 ```{r}
 #| label: combine-data
 #| output: asis
-# Retrieve time_type (already resolved in load-candidate chunk)
-env_time_type <- params$time_type
-
 # When time_type is weekly, align all dates to Sundays and aggregate
 if (env_time_type == "week") {
     df_guiding <- df_guiding %>%
