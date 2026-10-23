@@ -76,10 +76,6 @@ if (!exists("params")) {
     )
 }
 
-options(repos = c(
-    delphi = "https://cmu-delphi.r-universe.dev",
-    CRAN = "https://cloud.r-project.org"
-))
 # Optional date bounds: a blank one is open-ended, and if both are blank the
 # V5 query gets no date filter at all.
 start_date <- as.Date(params$start_day %||% "1900-01-01")
@@ -98,10 +94,10 @@ for (pkg in names(min_versions)) {
 }
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
-    epidatr, epiprocess, covidcast,
+    epidatr, epiprocess,
     tidyverse, scales, patchwork,
     knitr, here, MMWRweek, glue, DT,
-    fs, arrow, data.table
+    fs, arrow
 )
 
 # Invalidate knitr cache when params or local input files change.
@@ -196,9 +192,9 @@ as an `epi_archive`. The central question is:
 ::: {.callout-important icon=false}
 ## Notation and terminology {.unnumbered}
 
-- **Reference date**: The date when the event occurred. For data fetched from the Delphi Epidata API, this is the `time_value` column.
+- **Reference date**: The date when the event occurred. For data fetched from the Delphi Epidata API, this is the `reference_time` column.
 
-- **Report date**: The date attached to a published or released Report value for a given reference date. For data fetched from the Delphi Epidata API, this is the `issue_date` column.
+- **Report date**: The date attached to a published or released Report value for a given reference date. For data fetched from the Delphi Epidata API, this is the `report_time` column.
 
 - **Lag**: The elapsed time between the reference date and the report date.
 
@@ -216,7 +212,7 @@ as an `epi_archive`. The central question is:
 
 - **Initial report lag cutoff**: `r params$max_initial_report_lag_days` days. Pairs whose first observed report occurs later than this are excluded from revision diagnostics.
 
-**Caution**: The report date used in this notebook is determined entirely by the input data. For data fetched from the Delphi Epidata API, the report date is the provided `issue_date`. This date may reflect a publication rule, model run, file-generation process, or API version tag, rather than the first date when the underlying raw data became available.
+**Caution**: The report date used in this notebook is determined entirely by the input data. For data fetched from the Delphi Epidata API, the report date is the provided `report_time`. This date may reflect a publication rule, model run, file-generation process, or API version tag, rather than the first date when the underlying raw data became available.
 
 If you upload a CSV file, confirm that the report date has the intended meaning for your indicator before interpreting minimum lag, reporting latency, or stabilization time.
 :::
@@ -2819,43 +2815,9 @@ publication timing.
 #| cache: true
 weekday_levels <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
-actual_report_weekday_path <- here::here(
-    "revision_analysis",
-    "data",
-    "nhsn_confirmed_admissions_covid_ew_archive.csv"
-)
-use_actual_report_weekday_file <- identical(params$source, "nhsn") &&
-    identical(params$signal, "confirmed_admissions_covid_ew") &&
-    file.exists(actual_report_weekday_path)
+weekday_subtitle <- "Follow-up revision records only; locations pooled within each report year. Weekday uses the report dates available in the analysis input."
 
-revision_weekday_source_df <- if (use_actual_report_weekday_file) {
-    data.table::fread(
-        actual_report_weekday_path,
-        select = c("geo_value", "time_value", "version", "value")
-    ) %>%
-        as_tibble() %>%
-        transmute(
-            geo_value = tolower(geo_value),
-            time_value = as.Date(time_value),
-            version = as.Date(version),
-            value
-        ) %>%
-        semi_join(retained_pairs, by = c("geo_value", "time_value")) %>%
-        distinct(geo_value, time_value, version, .keep_all = TRUE) %>%
-        group_by(geo_value, time_value) %>%
-        mutate(is_initial_release = version == min(version, na.rm = TRUE)) %>%
-        ungroup()
-} else {
-    backfill_df
-}
-
-weekday_subtitle <- if (use_actual_report_weekday_file) {
-    "Follow-up revision records only; locations pooled within each report year. Weekday uses original, unaligned report dates."
-} else {
-    "Follow-up revision records only; locations pooled within each report year. Weekday uses the report dates available in the analysis input."
-}
-
-revision_weekday_df <- revision_weekday_source_df %>%
+revision_weekday_df <- backfill_df %>%
     filter(!is_initial_release) %>%
     mutate(
         report_year = lubridate::year(version),
